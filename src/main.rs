@@ -410,6 +410,73 @@ fn reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str, send: 
 }
 
 /// GUI path: open a local browser page so the human can review/edit/approve before sending.
+/// Cheap Slack-only poll: ts of the most recent incoming message (no Copilot used).
+fn latest_incoming_ts(subdomain: &str) -> Result<f64> {
+    let sc = slack_api::SlackClient::connect(subdomain)?;
+    let me = sc
+        .auth_test()?["user_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let conv = sc.call(
+        "users.conversations",
+        &[
+            ("types", "public_channel,private_channel,im,mpim"),
+            ("limit", "200"),
+            ("exclude_archived", "true"),
+        ],
+    )?;
+    let empty = Vec::new();
+    let channels = conv["channels"].as_array().unwrap_or(&empty);
+    let mut best = 0f64;
+    for ch in channels.iter().take(30) {
+        let id = match ch["id"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let h = match sc.conversations_history(id, 1) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if let Some(msgs) = h["messages"].as_array() {
+            for m in msgs {
+                let u = m["user"].as_str().unwrap_or("");
+                let ts: f64 = m["ts"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                if u != me && ts > best {
+                    best = ts;
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Resident watcher: poll Slack (API only); when a message newer than startup arrives,
+/// open a fresh approval window in a separate process (winit runs once per process).
+/// Copilot is invoked only when a new message is detected — no idle quota use.
+fn watch(subdomain: &str, interval_secs: u64) -> Result<()> {
+    win32::hide_console_if_owned();
+    let exe = std::env::current_exe()?;
+    let mut last_seen = 0f64;
+    let mut initialized = false;
+    loop {
+        std::thread::sleep(Duration::from_secs(interval_secs.max(30)));
+        let latest = match latest_incoming_ts(subdomain) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !initialized {
+            last_seen = latest; // ignore the existing backlog at startup
+            initialized = true;
+            continue;
+        }
+        if latest > last_seen + 0.000_5 {
+            last_seen = latest;
+            let _ = std::process::Command::new(&exe).arg("reply-gui").status();
+        }
+    }
+}
+
 /// Launch the desktop window immediately (showing "準備中…") and do the slow
 /// Slack+Copilot work on a background thread so the user always sees a GUI.
 fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
@@ -603,6 +670,7 @@ impl eframe::App for GuiApp {
                             persona: self.s_persona.trim().to_owned(),
                             slack_subdomain: self.s_subdomain.trim().to_owned(),
                             knowledge_path: self.s_knowledge.trim().to_owned(),
+                            watch_interval_secs: config::Config::load().watch_interval_secs,
                         };
                         self.settings_msg = match c.save() {
                             Ok(_) => "保存しました（次回起動から反映）".to_owned(),
@@ -717,6 +785,9 @@ fn main() -> Result<()> {
         "reply-gui" => {
             reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
         }
+        "watch" => {
+            watch(&cfg.slack_subdomain, cfg.watch_interval_secs)?;
+        }
         "update" => {
             updater::check_and_update()?;
         }
@@ -728,6 +799,7 @@ fn main() -> Result<()> {
             println!("usage (no argument = open the desktop approval window):");
             println!("  tagami                  # = reply-gui (double-click opens this)");
             println!("  tagami reply-gui        # review/edit/approve a reply in a desktop window, then send");
+            println!("  tagami watch            # resident: poll Slack, pop the approval window on new messages");
             println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
             println!("  tagami update           # self-update from the latest GitHub release");
             println!("  tagami version          # show current version");

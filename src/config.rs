@@ -11,6 +11,8 @@ pub struct Config {
     pub slack_subdomain: String,
     /// Knowledge base file (facts/schedule/contacts/style) injected into the prompt.
     pub knowledge_path: String,
+    /// Resident watch poll interval in seconds.
+    pub watch_interval_secs: u64,
 }
 
 pub fn config_path() -> PathBuf {
@@ -30,6 +32,9 @@ impl Config {
                 "knowledge_path",
                 "G:\\マイドライブ\\tagamiAi\\knowledge.md",
             ),
+            watch_interval_secs: resolve(&txt, "TAGAMI_WATCH_INTERVAL", "watch_interval_secs", "180")
+                .parse()
+                .unwrap_or(180),
         }
     }
 

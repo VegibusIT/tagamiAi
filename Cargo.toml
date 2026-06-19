@@ -1,6 +1,6 @@
 [package]
 name = "tagami"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "AI田上 PoC: Slack <-> Copilot for Windows via UI Automation"
 
