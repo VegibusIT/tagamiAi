@@ -325,24 +325,30 @@ fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str) -> Result<Prepared> 
     println!("[最新の受信] ch={} : {}", channel, truncate(&msg, 140));
     let msg = truncate(&msg, 500);
 
-    let triage_prompt = format!(
-        "次のSlackメッセージに『{persona}』本人として返信すべきか判断してください。\
-         用件・質問・依頼・商談など対応が要る内容なら返信必要。挨拶のみ・雑談・自動通知・どうでもいい内容なら返信不要。\
-         回答は『返信必要』または『返信不要』のどちらかで始め、続けて理由を一言だけ書いてください。\n\nメッセージ:\n{msg}"
+    // Single combined call (judgment + draft) to halve Copilot usage (free quota).
+    let prompt = format!(
+        "あなたは『{persona}』本人です。次のSlackメッセージへの対応を決めてください。\
+         返信すべきでない（挨拶のみ・雑談・自動通知・どうでもいい内容）なら、出力は『返信不要』だけにしてください。\
+         返信すべきなら、1行目に『返信必要』と書き、2行目以降に返信本文だけを書いてください\
+         （前置き・解説・引用符なし。予定・可否・事実など自分が確実に知らないことは推測で断定せず、『確認して折り返します』等の確認形に）。\n\nメッセージ:\n{msg}"
     );
-    let judgment = copilot_send_and_read(uia, &triage_prompt)?;
-    println!("[判断] {}", truncate(&judgment, 120));
+    let resp = copilot_send_and_read(uia, &prompt)?;
 
-    let draft = if judgment.contains("返信不要") {
-        String::new()
+    let no_reply =
+        resp.trim_start().starts_with("返信不要") || (resp.contains("返信不要") && !resp.contains("返信必要"));
+    let (judgment, draft) = if no_reply {
+        ("返信不要".to_string(), String::new())
     } else {
-        let prompt = format!(
-            "あなたは『{persona}』本人です。以下のSlackメッセージへの返信本文を、{persona}本人として日本語で丁寧かつ簡潔に作成してください。\
-             返信本文だけを出力し、前置き・解説・引用符は不要です。\
-             重要: 予定・可否・事実など自分が確実に知らないことは推測で断定せず、必要なら『確認して折り返します』等の確認形にしてください。\n\nメッセージ:\n{msg}"
-        );
-        copilot_send_and_read(uia, &prompt)?
+        let body = resp.splitn(2, "返信必要").nth(1).unwrap_or(resp.as_str());
+        let body = body
+            .trim_start_matches(|c: char| {
+                matches!(c, '：' | ':' | '。' | '、' | ' ' | '　' | '\n' | '\r' | '\t' | '-')
+            })
+            .trim()
+            .to_string();
+        ("返信必要".to_string(), body)
     };
+    println!("[判断] {} / [下書き] {}", judgment, truncate(&draft, 80));
 
     Ok(Prepared {
         sc,
