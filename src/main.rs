@@ -447,6 +447,11 @@ fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -
         status: String::new(),
         error: String::new(),
         done: false,
+        settings_open: false,
+        s_persona: persona.to_owned(),
+        s_subdomain: subdomain.to_owned(),
+        s_knowledge: knowledge_path.to_owned(),
+        settings_msg: String::new(),
     };
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -524,6 +529,12 @@ struct GuiApp {
     status: String,
     error: String,
     done: bool,
+    // settings editor
+    settings_open: bool,
+    s_persona: String,
+    s_subdomain: String,
+    s_knowledge: String,
+    settings_msg: String,
 }
 
 impl eframe::App for GuiApp {
@@ -561,8 +572,54 @@ impl eframe::App for GuiApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("AI田上（{} として）", self.persona));
+            ui.horizontal(|ui| {
+                ui.heading(format!("AI田上（{} として）", self.persona));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ 設定").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
+                });
+            });
             ui.separator();
+
+            if self.settings_open {
+                ui.label("設定（保存すると次回起動から反映されます）");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("返信の主体（アカウント名）:");
+                    ui.text_edit_singleline(&mut self.s_persona);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Slackワークスペース（サブドメイン）:");
+                    ui.text_edit_singleline(&mut self.s_subdomain);
+                });
+                ui.add_space(4.0);
+                ui.label("知識ベースの保存場所（ファイルパス）:");
+                ui.add(egui::TextEdit::singleline(&mut self.s_knowledge).desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存").clicked() {
+                        let c = config::Config {
+                            persona: self.s_persona.trim().to_owned(),
+                            slack_subdomain: self.s_subdomain.trim().to_owned(),
+                            knowledge_path: self.s_knowledge.trim().to_owned(),
+                        };
+                        self.settings_msg = match c.save() {
+                            Ok(_) => "保存しました（次回起動から反映）".to_owned(),
+                            Err(e) => format!("保存失敗: {e}"),
+                        };
+                    }
+                    if ui.button("戻る").clicked() {
+                        self.settings_open = false;
+                    }
+                });
+                if !self.settings_msg.is_empty() {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.settings_msg);
+                }
+                return;
+            }
+
             match self.stage {
                 Stage::Loading => {
                     ui.add_space(24.0);

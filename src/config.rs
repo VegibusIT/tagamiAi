@@ -1,7 +1,8 @@
-//! Minimal settings, no external deps. Resolution order for each value:
-//!   1. environment variable (e.g. TAGAMI_PERSONA)
-//!   2. `tagami.toml` next to the working dir  (key = "value")
-//!   3. built-in default
+//! Settings, stored at %APPDATA%\tagami\config.toml so they persist wherever the
+//! exe runs. Editable from the GUI (Config::save). Each value can also be overridden
+//! by an environment variable.
+
+use std::path::PathBuf;
 
 pub struct Config {
     /// Whose voice the AI replies in (e.g. "安河内", "田上").
@@ -9,38 +10,54 @@ pub struct Config {
     /// Slack workspace subdomain for the API host, e.g. "vegibushq" -> vegibushq.slack.com.
     pub slack_subdomain: String,
     /// Knowledge base file (facts/schedule/contacts/style) injected into the prompt.
-    /// Lives on Google Drive so it can be edited from anywhere.
     pub knowledge_path: String,
+}
+
+pub fn config_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("tagami").join("config.toml")
 }
 
 impl Config {
     pub fn load() -> Config {
+        let txt = std::fs::read_to_string(config_path()).unwrap_or_default();
         Config {
-            persona: resolve("TAGAMI_PERSONA", "persona", "安河内"),
-            slack_subdomain: resolve("TAGAMI_SLACK_SUBDOMAIN", "slack_subdomain", "vegibushq"),
+            persona: resolve(&txt, "TAGAMI_PERSONA", "persona", "安河内"),
+            slack_subdomain: resolve(&txt, "TAGAMI_SLACK_SUBDOMAIN", "slack_subdomain", "vegibushq"),
             knowledge_path: resolve(
+                &txt,
                 "TAGAMI_KNOWLEDGE",
                 "knowledge_path",
                 "G:\\マイドライブ\\tagamiAi\\knowledge.md",
             ),
         }
     }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = config_path();
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        // Paths are written raw (single backslashes) and read back raw — our parser
+        // does no unescaping, so this round-trips on Windows.
+        let body = format!(
+            "# AI田上 設定（GUIから編集可）\npersona = \"{}\"\nslack_subdomain = \"{}\"\nknowledge_path = \"{}\"\n",
+            self.persona, self.slack_subdomain, self.knowledge_path
+        );
+        std::fs::write(path, body)
+    }
 }
 
-fn resolve(env_key: &str, file_key: &str, default: &str) -> String {
+fn resolve(file_txt: &str, env_key: &str, file_key: &str, default: &str) -> String {
     if let Ok(v) = std::env::var(env_key) {
         let v = v.trim();
         if !v.is_empty() {
             return v.to_string();
         }
     }
-    for path in ["tagami.toml", "config.toml"] {
-        if let Ok(txt) = std::fs::read_to_string(path) {
-            if let Some(v) = parse_value(&txt, file_key) {
-                if !v.is_empty() {
-                    return v;
-                }
-            }
+    if let Some(v) = parse_value(file_txt, file_key) {
+        if !v.is_empty() {
+            return v;
         }
     }
     default.to_string()
