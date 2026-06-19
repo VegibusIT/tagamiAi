@@ -8,6 +8,9 @@ pub struct Config {
     pub persona: String,
     /// Slack workspace subdomain for the API host, e.g. "vegibushq" -> vegibushq.slack.com.
     pub slack_subdomain: String,
+    /// Knowledge base file (facts/schedule/contacts/style) injected into the prompt.
+    /// Lives on Google Drive so it can be edited from anywhere.
+    pub knowledge_path: String,
 }
 
 impl Config {
@@ -15,6 +18,11 @@ impl Config {
         Config {
             persona: resolve("TAGAMI_PERSONA", "persona", "安河内"),
             slack_subdomain: resolve("TAGAMI_SLACK_SUBDOMAIN", "slack_subdomain", "vegibushq"),
+            knowledge_path: resolve(
+                "TAGAMI_KNOWLEDGE",
+                "knowledge_path",
+                "G:\\マイドライブ\\tagamiAi\\knowledge.md",
+            ),
         }
     }
 }

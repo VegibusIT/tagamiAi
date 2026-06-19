@@ -275,7 +275,7 @@ struct Prepared {
 
 /// Connect, find the most recent incoming message, triage it, and (if needed)
 /// draft a reply as `persona`. Heavy work (Copilot) happens here, before any UI.
-fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str) -> Result<Prepared> {
+fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<Prepared> {
     let sc = slack_api::SlackClient::connect(subdomain)?;
     let auth = sc.auth_test()?;
     let me = auth["user_id"].as_str().unwrap_or_default().to_string();
@@ -325,9 +325,20 @@ fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str) -> Result<Prepared> 
     println!("[最新の受信] ch={} : {}", channel, truncate(&msg, 140));
     let msg = truncate(&msg, 500);
 
+    // Knowledge base (Drive) — facts the AI may rely on; stops it inventing schedules.
+    let knowledge = std::fs::read_to_string(knowledge_path).unwrap_or_default();
+    let knowledge_block = if knowledge.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "【{persona}に関する前提情報（これに反する推測はしない。ここに無い事実は断定しない）】\n{}\n\n",
+            knowledge.trim()
+        )
+    };
+
     // Single combined call (judgment + draft) to halve Copilot usage (free quota).
     let prompt = format!(
-        "あなたは『{persona}』本人です。次のSlackメッセージへの対応を決めてください。\
+        "{knowledge_block}あなたは『{persona}』本人です。次のSlackメッセージへの対応を決めてください。\
          返信すべきでない（挨拶のみ・雑談・自動通知・どうでもいい内容）なら、出力は『返信不要』だけにしてください。\
          返信すべきなら、1行目に『返信必要』と書き、2行目以降に返信本文だけを書いてください\
          （前置き・解説・引用符なし。予定・可否・事実など自分が確実に知らないことは推測で断定せず、『確認して折り返します』等の確認形に）。\n\nメッセージ:\n{msg}"
@@ -361,8 +372,8 @@ fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str) -> Result<Prepared> 
 }
 
 /// CLI path: print the draft; post it (threaded) only with `send`.
-fn reply(uia: &Uia, persona: &str, subdomain: &str, send: bool) -> Result<()> {
-    let p = prepare_reply(uia, persona, subdomain)?;
+fn reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str, send: bool) -> Result<()> {
+    let p = prepare_reply(uia, persona, subdomain, knowledge_path)?;
     if p.draft.trim().is_empty() {
         println!("=> 返信不要と判断。スキップします。");
         return Ok(());
@@ -378,8 +389,8 @@ fn reply(uia: &Uia, persona: &str, subdomain: &str, send: bool) -> Result<()> {
 }
 
 /// GUI path: open a local browser page so the human can review/edit/approve before sending.
-fn reply_gui(uia: &Uia, persona: &str, subdomain: &str) -> Result<()> {
-    let p = prepare_reply(uia, persona, subdomain)?;
+fn reply_gui(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
+    let p = prepare_reply(uia, persona, subdomain, knowledge_path)?;
     if p.draft.trim().is_empty() {
         println!("=> 返信不要と判断。GUIは開きません。");
         return Ok(());
@@ -518,7 +529,7 @@ fn serve_approval(p: Prepared, persona: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    let cmd = args.get(1).map(String::as_str).unwrap_or("");
     let uia = Uia::new()?;
     let cfg = config::Config::load();
     match cmd {
@@ -540,10 +551,10 @@ fn main() -> Result<()> {
         }
         "reply" => {
             let send = args.iter().any(|a| a == "--send");
-            reply(&uia, &cfg.persona, &cfg.slack_subdomain, send)?;
+            reply(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path, send)?;
         }
         "reply-gui" => {
-            reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain)?;
+            reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
         }
         "update" => {
             updater::check_and_update()?;
@@ -551,17 +562,19 @@ fn main() -> Result<()> {
         "version" => {
             println!("tagami {}", updater::current_version());
         }
-        _ => {
+        "help" | "-h" | "--help" => {
             println!("AI田上 PoC");
-            println!("usage:");
-            println!("  tagami slack-read");
-            println!("  tagami copilot-read");
-            println!("  tagami copilot-type \"text\"");
-            println!("  tagami copilot-ask \"prompt\"");
-            println!("  tagami reply [--send]   # draft (or send) a reply to the latest Slack message");
+            println!("usage (no argument = open the desktop approval window):");
+            println!("  tagami                  # = reply-gui (double-click opens this)");
             println!("  tagami reply-gui        # review/edit/approve a reply in a desktop window, then send");
+            println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
             println!("  tagami update           # self-update from the latest GitHub release");
             println!("  tagami version          # show current version");
+            println!("  tagami slack-auth       # check Slack auth");
+        }
+        _ => {
+            // No argument (e.g. double-click) or unknown command: open the desktop GUI.
+            reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
         }
     }
     Ok(())
