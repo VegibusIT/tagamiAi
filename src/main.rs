@@ -389,13 +389,60 @@ fn reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str, send: 
 }
 
 /// GUI path: open a local browser page so the human can review/edit/approve before sending.
-fn reply_gui(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
-    let p = prepare_reply(uia, persona, subdomain, knowledge_path)?;
-    if p.draft.trim().is_empty() {
-        println!("=> 返信不要と判断。GUIは開きません。");
-        return Ok(());
+/// Launch the desktop window immediately (showing "準備中…") and do the slow
+/// Slack+Copilot work on a background thread so the user always sees a GUI.
+fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
+    win32::hide_console_if_owned();
+
+    let (tx, rx) = std::sync::mpsc::channel::<PrepMsg>();
+    {
+        let persona = persona.to_owned();
+        let subdomain = subdomain.to_owned();
+        let knowledge_path = knowledge_path.to_owned();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<PrepMsg> {
+                let uia = Uia::new()?; // own COM/UIA on this thread
+                let p = prepare_reply(&uia, &persona, &subdomain, &knowledge_path)?;
+                if p.draft.trim().is_empty() {
+                    Ok(PrepMsg::NoReply(p.judgment))
+                } else {
+                    Ok(PrepMsg::Ready(Box::new(p)))
+                }
+            })();
+            let _ = tx.send(result.unwrap_or_else(|e| PrepMsg::Error(e.to_string())));
+        });
     }
-    serve_approval(p, persona)
+
+    let app = GuiApp {
+        persona: persona.to_owned(),
+        rx,
+        stage: Stage::Loading,
+        incoming: String::new(),
+        judgment: String::new(),
+        draft: String::new(),
+        sc: None,
+        channel: String::new(),
+        thread_ts: String::new(),
+        status: String::new(),
+        error: String::new(),
+        done: false,
+    };
+    let opts = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([720.0, 640.0])
+            .with_drag_and_drop(false),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "AI田上 返信確認",
+        opts,
+        Box::new(|cc| {
+            setup_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| anyhow!("eframe error: {e}"))?;
+    Ok(())
 }
 
 /// Load a Japanese-capable font from Windows so egui can render CJK text.
@@ -429,102 +476,138 @@ fn setup_fonts(ctx: &eframe::egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-struct ApprovalApp {
+enum PrepMsg {
+    Ready(Box<Prepared>),
+    NoReply(String),
+    Error(String),
+}
+
+#[derive(PartialEq)]
+enum Stage {
+    Loading,
+    Ready,
+    NoReply,
+    Error,
+}
+
+struct GuiApp {
     persona: String,
+    rx: std::sync::mpsc::Receiver<PrepMsg>,
+    stage: Stage,
     incoming: String,
     judgment: String,
     draft: String,
-    sc: slack_api::SlackClient,
+    sc: Option<slack_api::SlackClient>,
     channel: String,
     thread_ts: String,
     status: String,
+    error: String,
     done: bool,
 }
 
-impl eframe::App for ApprovalApp {
+impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
+        if self.stage == Stage::Loading {
+            match self.rx.try_recv() {
+                Ok(PrepMsg::Ready(p)) => {
+                    let p = *p;
+                    self.incoming = p.incoming;
+                    self.judgment = p.judgment;
+                    self.draft = p.draft;
+                    self.channel = p.channel;
+                    self.thread_ts = p.thread_ts;
+                    self.sc = Some(p.sc);
+                    self.stage = Stage::Ready;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Ok(PrepMsg::NoReply(j)) => {
+                    self.judgment = j;
+                    self.stage = Stage::NoReply;
+                }
+                Ok(PrepMsg::Error(e)) => {
+                    self.error = e;
+                    self.stage = Stage::Error;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = "準備処理が異常終了しました".to_owned();
+                    self.stage = Stage::Error;
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("AI田上 — 返信の確認（{} として）", self.persona));
-            ui.add_space(6.0);
-            ui.label("受信メッセージ:");
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(&self.incoming);
-            });
-            ui.add_space(4.0);
-            ui.label(format!("AIの判断: {}", self.judgment));
-            ui.add_space(8.0);
-            ui.label("返信案（編集できます）:");
-            ui.add(
-                egui::TextEdit::multiline(&mut self.draft)
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.done, egui::Button::new("スレッドに送信"))
-                    .clicked()
-                {
-                    match self
-                        .sc
-                        .post_message(&self.channel, &self.draft, Some(&self.thread_ts))
-                    {
-                        Ok(j) => self.status = format!("送信しました（ok={}）", j["ok"]),
-                        Err(e) => self.status = format!("送信エラー: {e}"),
+            ui.heading(format!("AI田上（{} として）", self.persona));
+            ui.separator();
+            match self.stage {
+                Stage::Loading => {
+                    ui.add_space(24.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("準備中… Slack取得・AI判断・返信生成（30〜60秒ほど）");
+                    });
+                }
+                Stage::Error => {
+                    ui.colored_label(egui::Color32::RED, format!("エラー: {}", self.error));
+                }
+                Stage::NoReply => {
+                    ui.label(format!("AIの判断: {}", self.judgment));
+                    ui.add_space(6.0);
+                    ui.label("→ 返信不要と判断。送信する返信はありません。");
+                    if ui.button("閉じる").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    self.done = true;
                 }
-                if ui
-                    .add_enabled(!self.done, egui::Button::new("送らない"))
-                    .clicked()
-                {
-                    self.status = "送信しませんでした。".to_owned();
-                    self.done = true;
+                Stage::Ready => {
+                    ui.label("受信メッセージ:");
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(&self.incoming);
+                    });
+                    ui.add_space(4.0);
+                    ui.label(format!("AIの判断: {}", self.judgment));
+                    ui.add_space(6.0);
+                    ui.label("返信案（編集できます）:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.draft)
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.done, egui::Button::new("スレッドに送信"))
+                            .clicked()
+                        {
+                            if let Some(sc) = &self.sc {
+                                match sc.post_message(&self.channel, &self.draft, Some(&self.thread_ts)) {
+                                    Ok(j) => self.status = format!("送信しました（ok={}）", j["ok"]),
+                                    Err(e) => self.status = format!("送信エラー: {e}"),
+                                }
+                                self.done = true;
+                            }
+                        }
+                        if ui
+                            .add_enabled(!self.done, egui::Button::new("送らない"))
+                            .clicked()
+                        {
+                            self.status = "送信しませんでした。".to_owned();
+                            self.done = true;
+                        }
+                        if self.done && ui.button("閉じる").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                    if !self.status.is_empty() {
+                        ui.add_space(8.0);
+                        ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.status);
+                    }
                 }
-                if self.done && ui.button("閉じる").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            if !self.status.is_empty() {
-                ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.status);
             }
         });
     }
-}
-
-/// Open a native desktop window for the human to review/edit/approve, then send.
-fn serve_approval(p: Prepared, persona: &str) -> Result<()> {
-    let app = ApprovalApp {
-        persona: persona.to_owned(),
-        incoming: p.incoming,
-        judgment: p.judgment,
-        draft: p.draft,
-        sc: p.sc,
-        channel: p.channel,
-        thread_ts: p.thread_ts,
-        status: String::new(),
-        done: false,
-    };
-    let opts = eframe::NativeOptions {
-        // Disable drag&drop so winit doesn't call OleInitialize (STA) — our UIA code
-        // already put this thread in COM MTA, which would otherwise clash.
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 640.0])
-            .with_drag_and_drop(false),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "AI田上 返信確認",
-        opts,
-        Box::new(|cc| {
-            setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    )
-    .map_err(|e| anyhow!("eframe error: {e}"))?;
-    Ok(())
 }
 
 fn main() -> Result<()> {

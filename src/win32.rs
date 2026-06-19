@@ -7,11 +7,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VIRTUAL_KEY,
     VK_CONTROL, VK_RETURN,
 };
+use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE,
-    WM_GETOBJECT,
+    IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SW_HIDE,
+    SW_RESTORE, WM_GETOBJECT,
 };
+
+/// Hide the console window, but only if this process owns it alone (i.e. launched by
+/// double-click). When run from a terminal the console is shared, so we leave it.
+pub fn hide_console_if_owned() {
+    unsafe {
+        let mut buf = [0u32; 8];
+        let count = GetConsoleProcessList(&mut buf);
+        if count == 1 {
+            let hwnd = GetConsoleWindow();
+            if !hwnd.is_invalid() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+}
 
 /// UIA root object id — the magic lParam that forces a Chromium/WebView2 renderer
 /// (e.g. Copilot for Windows) to build its UI Automation tree. -4 (OBJID_CLIENT)

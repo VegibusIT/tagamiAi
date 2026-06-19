@@ -1,6 +1,6 @@
 [package]
 name = "tagami"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "AI田上 PoC: Slack <-> Copilot for Windows via UI Automation"
 
@@ -21,6 +21,7 @@ features = [
   "Win32_System_Com",
   "Win32_System_Memory",
   "Win32_System_DataExchange",
+  "Win32_System_Console",
   "Win32_System_Threading",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
