@@ -1,0 +1,5 @@
+/target
+*.old.exe
+*.new.exe
+slack_capture.txt
+tagami_ocr_test.png
