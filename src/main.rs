@@ -173,8 +173,29 @@ fn copilot_type(uia: &Uia, text: &str) -> Result<()> {
 }
 
 /// Send a prompt to Copilot and return its reply text.
+const COPILOT_APP_ID: &str = "Microsoft.Copilot_8wekyb3d8bbwe!App";
+
+/// Find Copilot's window; if it's only resident in the tray (no window), launch it and wait.
+fn ensure_copilot_window() -> Option<HWND> {
+    if let Some(h) = find_visible_window_by_title("Copilot") {
+        return Some(h);
+    }
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("shell:AppsFolder\\{COPILOT_APP_ID}"))
+        .spawn();
+    for _ in 0..24 {
+        sleep(Duration::from_millis(500));
+        if let Some(h) = find_visible_window_by_title("Copilot") {
+            return Some(h);
+        }
+    }
+    None
+}
+
 fn copilot_send_and_read(uia: &Uia, prompt: &str) -> Result<String> {
-    let hwnd = find_visible_window_by_title("Copilot").ok_or_else(|| anyhow!("Copilot window not found"))?;
+    let hwnd = ensure_copilot_window().ok_or_else(|| {
+        anyhow!("Copilotを開けませんでした。Copilot for Windows を起動してから再試行してください。")
+    })?;
     restore_and_foreground(hwnd);
 
     // Start a fresh chat so the previous turn's answer can't be mistaken for ours.
