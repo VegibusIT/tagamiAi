@@ -3,3 +3,5 @@
 *.new.exe
 slack_capture.txt
 tagami_ocr_test.png
+__pycache__/
+*.pyc
