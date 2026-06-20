@@ -12,7 +12,7 @@ mod uia;
 mod updater;
 mod win32;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::thread::sleep;
 use std::time::Duration;
 use windows::Win32::Foundation::HWND;
@@ -76,8 +76,12 @@ fn extract_response(els: &[IUIAutomationElement], prompt: &str) -> String {
         if t.is_empty() || control_type(el) != CT_TEXT {
             continue;
         }
-        if t == "Copilot へメッセージを送る" {
-            break;
+        if t == "Copilot へメッセージを送る"
+            || t.contains("Copilot のエクスペリエンス")
+            || t.contains("フィードバックがあれば")
+            || t.contains("Copilot をご利用")
+        {
+            break; // reached Copilot's trailing UI/footer — stop
         }
         if t == "あなたの発言" || t == "Copilot の発言" || t == prompt {
             continue;
@@ -477,6 +481,95 @@ fn watch(subdomain: &str, interval_secs: u64) -> Result<()> {
     }
 }
 
+/// 事前学習: collect the user's own past Slack messages, ask Copilot to distil a
+/// style profile, and write it into the knowledge base so replies match their voice.
+fn learn(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
+    let sc = slack_api::SlackClient::connect(subdomain)?;
+    let me = sc
+        .auth_test()?["user_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    println!("過去の自分の発言を収集中…");
+    let conv = sc.call(
+        "users.conversations",
+        &[
+            ("types", "public_channel,private_channel,im,mpim"),
+            ("limit", "200"),
+            ("exclude_archived", "true"),
+        ],
+    )?;
+    let empty = Vec::new();
+    let channels = conv["channels"].as_array().unwrap_or(&empty);
+    let mut samples: Vec<String> = Vec::new();
+    'outer: for ch in channels.iter().take(40) {
+        let id = match ch["id"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let h = match sc.conversations_history(id, 30) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if let Some(msgs) = h["messages"].as_array() {
+            for m in msgs {
+                if m["user"].as_str() == Some(me.as_str()) {
+                    let t = m["text"].as_str().unwrap_or("").trim();
+                    if t.chars().count() >= 8 && !t.starts_with('<') {
+                        samples.push(truncate(t, 200));
+                        if samples.len() >= 40 {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if samples.len() < 3 {
+        bail!("学習に使える自分の発言が十分に集まりませんでした（{}件）", samples.len());
+    }
+    println!("発言 {} 件で文体を分析します…", samples.len());
+    let joined = samples.join("\n---\n");
+    let prompt = format!(
+        "以下は『{persona}』本人の過去のSlack発言です。本人になりきって返信を書くための『文体プロファイル』を作ってください。\
+         書き出し方・よく使う語尾や言い回し・丁寧さ・絵文字の有無・文の長さの傾向を、箇条書き5〜8項目で簡潔に。\
+         箇条書き本文だけを出力してください。\n\n発言例:\n{joined}"
+    );
+    let profile = copilot_send_and_read(uia, &prompt)?;
+    if profile.trim().is_empty() {
+        bail!("文体プロファイルの生成に失敗しました");
+    }
+    update_knowledge_section(knowledge_path, "## 文体プロファイル（自動生成）", profile.trim())?;
+    println!(
+        "文体プロファイルを保存しました → {knowledge_path}\n---\n{}",
+        truncate(&profile, 300)
+    );
+    Ok(())
+}
+
+/// Replace (or append) a named section in the knowledge-base markdown file.
+fn update_knowledge_section(path: &str, header: &str, body: &str) -> Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let cleaned = if let Some(idx) = existing.find(header) {
+        let before = existing[..idx].trim_end().to_string();
+        let after = &existing[idx + header.len()..];
+        if let Some(rel) = after.find("\n## ") {
+            format!("{before}\n\n{}", after[rel + 1..].trim_start())
+        } else {
+            before
+        }
+    } else {
+        existing.trim_end().to_string()
+    };
+    let new = if cleaned.is_empty() {
+        format!("{header}\n{body}\n")
+    } else {
+        format!("{cleaned}\n\n{header}\n{body}\n")
+    };
+    std::fs::write(path, new)?;
+    Ok(())
+}
+
 /// Launch the desktop window immediately (showing "準備中…") and do the slow
 /// Slack+Copilot work on a background thread so the user always sees a GUI.
 fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
@@ -788,6 +881,9 @@ fn main() -> Result<()> {
         "watch" => {
             watch(&cfg.slack_subdomain, cfg.watch_interval_secs)?;
         }
+        "learn" => {
+            learn(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
+        }
         "update" => {
             updater::check_and_update()?;
         }
@@ -800,6 +896,7 @@ fn main() -> Result<()> {
             println!("  tagami                  # = reply-gui (double-click opens this)");
             println!("  tagami reply-gui        # review/edit/approve a reply in a desktop window, then send");
             println!("  tagami watch            # resident: poll Slack, pop the approval window on new messages");
+            println!("  tagami learn            # learn your writing style from past Slack posts -> knowledge.md");
             println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
             println!("  tagami update           # self-update from the latest GitHub release");
             println!("  tagami version          # show current version");
