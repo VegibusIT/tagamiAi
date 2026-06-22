@@ -525,26 +525,62 @@ fn learn(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Res
             }
         }
     }
-    if samples.len() < 3 {
-        bail!("学習に使える自分の発言が十分に集まりませんでした（{}件）", samples.len());
+    let drive_summary = collect_drive_summary("G:\\マイドライブ", 80);
+    if samples.is_empty() && drive_summary.is_empty() {
+        bail!("Slackの発言もGoogleドライブの項目も取得できませんでした");
     }
-    println!("発言 {} 件で文体を分析します…", samples.len());
+    println!(
+        "Slack {}件 + Driveの項目 {}件 で分析します…",
+        samples.len(),
+        drive_summary.lines().filter(|l| !l.trim().is_empty()).count()
+    );
     let joined = samples.join("\n---\n");
     let prompt = format!(
-        "以下は『{persona}』本人の過去のSlack発言です。本人になりきって返信を書くための『文体プロファイル』を作ってください。\
-         書き出し方・よく使う語尾や言い回し・丁寧さ・絵文字の有無・文の長さの傾向を、箇条書き5〜8項目で簡潔に。\
-         箇条書き本文だけを出力してください。\n\n発言例:\n{joined}"
+        "以下は『{persona}』本人のSlack発言例と、本人のGoogleドライブにあるフォルダ/ファイル名です。\
+         ここから次の2つを箇条書きでまとめてください。\
+         【人物・業務】= どんな役割・業務・専門・関心を持つ人か（断定せず『〜と思われる』程度に）。\
+         【文体】= 本人になりきって返信するための書き方の特徴（書き出し・語尾・丁寧さ・絵文字・文の長さ）。\
+         見出し『【人物・業務】』『【文体】』を付け、箇条書き本文だけを出力してください。\n\n\
+         ■Slack発言例:\n{joined}\n\n■Googleドライブの項目:\n{drive_summary}"
     );
     let profile = copilot_send_and_read(uia, &prompt)?;
     if profile.trim().is_empty() {
-        bail!("文体プロファイルの生成に失敗しました");
+        bail!("プロファイルの生成に失敗しました");
     }
-    update_knowledge_section(knowledge_path, "## 文体プロファイル（自動生成）", profile.trim())?;
+    update_knowledge_section(
+        knowledge_path,
+        "## 自動生成プロファイル（人物・業務・文体）",
+        profile.trim(),
+    )?;
     println!(
-        "文体プロファイルを保存しました → {knowledge_path}\n---\n{}",
-        truncate(&profile, 300)
+        "プロファイルを保存しました → {knowledge_path}\n---\n{}",
+        truncate(&profile, 400)
     );
     Ok(())
+}
+
+/// Top-level items in the user's Google Drive (folder/file names) — signals what they
+/// create and work on. Names only (no content download); capped.
+fn collect_drive_summary(root: &str, max: usize) -> String {
+    let mut items: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name.starts_with('~') || name == "desktop.ini" {
+                continue;
+            }
+            let kind = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                "[フォルダ]"
+            } else {
+                "[ファイル]"
+            };
+            items.push(format!("{kind} {name}"));
+            if items.len() >= max {
+                break;
+            }
+        }
+    }
+    items.join("\n")
 }
 
 /// Replace (or append) a named section in the knowledge-base markdown file.
