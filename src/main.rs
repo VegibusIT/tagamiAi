@@ -611,6 +611,7 @@ fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -
         s_persona: persona.to_owned(),
         s_subdomain: subdomain.to_owned(),
         s_knowledge: knowledge_path.to_owned(),
+        s_interval: config::Config::load().watch_interval_secs.to_string(),
         settings_msg: String::new(),
     };
     let opts = eframe::NativeOptions {
@@ -694,6 +695,7 @@ struct GuiApp {
     s_persona: String,
     s_subdomain: String,
     s_knowledge: String,
+    s_interval: String,
     settings_msg: String,
 }
 
@@ -756,6 +758,11 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 ui.label("知識ベースの保存場所（ファイルパス）:");
                 ui.add(egui::TextEdit::singleline(&mut self.s_knowledge).desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Slack確認の間隔（秒・最小30）:");
+                    ui.text_edit_singleline(&mut self.s_interval);
+                });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
@@ -763,7 +770,7 @@ impl eframe::App for GuiApp {
                             persona: self.s_persona.trim().to_owned(),
                             slack_subdomain: self.s_subdomain.trim().to_owned(),
                             knowledge_path: self.s_knowledge.trim().to_owned(),
-                            watch_interval_secs: config::Config::load().watch_interval_secs,
+                            watch_interval_secs: self.s_interval.trim().parse().unwrap_or(180),
                         };
                         self.settings_msg = match c.save() {
                             Ok(_) => "保存しました（次回起動から反映）".to_owned(),
