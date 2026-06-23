@@ -11,8 +11,9 @@ use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE,
-    WM_GETOBJECT,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_RESTORE, WM_GETOBJECT,
 };
 
 /// Hide the console window, but only if this process owns it alone (i.e. launched by
@@ -125,6 +126,29 @@ pub fn window_xy(hwnd: HWND) -> (i32, i32) {
         let mut r = RECT::default();
         let _ = GetWindowRect(hwnd, &mut r);
         (r.left, r.top)
+    }
+}
+
+/// Primary monitor work area (screen minus taskbar): (left, top, width, height).
+pub fn work_area() -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut r as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    (r.left, r.top, r.right - r.left, r.bottom - r.top)
+}
+
+/// Position AND size a window without changing focus or z-order. Used to tuck Copilot into a
+/// small corner so it stays visible (it must, to keep generating) without hogging the screen.
+pub fn place_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetWindowPos(hwnd, HWND::default(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 

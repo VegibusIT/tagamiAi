@@ -205,16 +205,15 @@ fn copilot_send_and_read(uia: &Uia, prompt: &str) -> Result<String> {
     let user_fg = get_foreground_window();
     // Copilot is a Chromium/WebView2 app: it only accepts input and *streams its reply* while
     // genuinely visible on screen (off-screen or covered, generation pauses). It does NOT,
-    // however, need to remain the FOREGROUND window — so we show + focus it just long enough to
-    // type, then hand focus back; the reply keeps streaming in the still-visible window and we
-    // read it via UIA. Force an on-screen spot only if a prior turn parked it off-screen.
-    let (wx, _) = window_xy(hwnd);
-    if wx <= -10000 {
-        move_onscreen(hwnd, 40, 40);
-    } else {
-        restore_and_foreground(hwnd);
-    }
-    sleep(Duration::from_millis(300));
+    // however, need to remain the FOREGROUND window. So we dock it into a corner, bring it
+    // forward just long enough to type, then hand focus back. For typing we keep it wide enough
+    // (>=840px) that the "新しいチャット" button stays on screen; afterwards we shrink it.
+    let (ax, ay, aw, ah) = work_area();
+    let in_w = 920.min(aw);
+    let in_h = 800.min(ah);
+    place_window(hwnd, ax + aw - in_w, ay + ah - in_h, in_w, in_h);
+    set_foreground(hwnd);
+    sleep(Duration::from_millis(350));
 
     // Start a fresh chat so the previous turn's answer can't be mistaken for ours.
     if let Ok(els) = read_app(uia, hwnd) {
@@ -266,16 +265,20 @@ fn copilot_send_and_read(uia: &Uia, prompt: &str) -> Result<String> {
         press_enter();
     }
 
-    // The prompt is in. Wait until Copilot accepts it (the composer clears), then hand focus
-    // straight back to the user — Copilot stays visible and keeps streaming the reply, which we
-    // read via UIA without needing focus. The user gets their active window back in ~1s instead
-    // of being locked out for the whole reply.
+    // The prompt is in. Wait until Copilot accepts it (the composer clears), then shrink it to a
+    // small bottom-right corner — still visible, so it keeps streaming the reply (read via UIA),
+    // but out of the way — and hand focus straight back to the user. They get their active
+    // window back in ~1s with only a small corner window left, instead of a full-screen Copilot
+    // stealing focus for the whole reply.
     for _ in 0..24 {
         sleep(Duration::from_millis(150));
         if current_value(&input).trim().is_empty() {
             break;
         }
     }
+    let sm_w = 600.min(aw);
+    let sm_h = 700.min(ah);
+    place_window(hwnd, ax + aw - sm_w, ay + ah - sm_h, sm_w, sm_h);
     if !user_fg.is_invalid() && user_fg != hwnd {
         set_foreground(user_fg);
     }
