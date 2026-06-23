@@ -200,7 +200,21 @@ fn copilot_send_and_read(uia: &Uia, prompt: &str) -> Result<String> {
     let hwnd = ensure_copilot_window().ok_or_else(|| {
         anyhow!("Copilotを開けませんでした。Copilot for Windows を起動してから再試行してください。")
     })?;
-    restore_and_foreground(hwnd);
+    // Remember the window the user is working in so we can hand focus back the instant the
+    // prompt is submitted.
+    let user_fg = get_foreground_window();
+    // Copilot is a Chromium/WebView2 app: it only accepts input and *streams its reply* while
+    // genuinely visible on screen (off-screen or covered, generation pauses). It does NOT,
+    // however, need to remain the FOREGROUND window — so we show + focus it just long enough to
+    // type, then hand focus back; the reply keeps streaming in the still-visible window and we
+    // read it via UIA. Force an on-screen spot only if a prior turn parked it off-screen.
+    let (wx, _) = window_xy(hwnd);
+    if wx <= -10000 {
+        move_onscreen(hwnd, 40, 40);
+    } else {
+        restore_and_foreground(hwnd);
+    }
+    sleep(Duration::from_millis(300));
 
     // Start a fresh chat so the previous turn's answer can't be mistaken for ours.
     if let Ok(els) = read_app(uia, hwnd) {
@@ -220,24 +234,51 @@ fn copilot_send_and_read(uia: &Uia, prompt: &str) -> Result<String> {
         .chars()
         .map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c })
         .collect();
-    // Click the input box to guarantee keyboard focus (UIA SetFocus alone is unreliable here).
+    // Click then SetFocus so the WebView2 input reliably has the editing caret for the paste.
     if let Some((l, t, r, b)) = uia::bounding_rect(&input) {
         click((l + r) / 2, (t + b) / 2);
         sleep(Duration::from_millis(250));
     }
     set_focus(&input);
-    sleep(Duration::from_millis(300));
+    sleep(Duration::from_millis(350));
     select_all();
     sleep(Duration::from_millis(150));
-    // Paste long prompts via the clipboard — per-keystroke typing drops characters
-    // on long input and the message never submits.
+    // Paste long prompts via the clipboard — per-keystroke typing drops characters on long
+    // input and the message never submits.
     if set_clipboard_text(&clean) {
         paste();
     } else {
         type_unicode(&clean);
     }
     sleep(Duration::from_millis(700));
-    press_enter();
+    // Submit by invoking Copilot's Send button — more reliable than a synthesized Enter on this
+    // WebView2 input. The button is labelled "メッセージの送信" only once the composer holds
+    // text; fall back to Enter if it isn't found.
+    let submitted = richest_subtree(uia, hwnd)
+        .ok()
+        .and_then(|all| {
+            all.iter()
+                .find(|e| control_type(e) == CT_BUTTON && name(e).contains("メッセージの送信"))
+                .map(|b| uia::invoke(b).is_ok())
+        })
+        .unwrap_or(false);
+    if !submitted {
+        press_enter();
+    }
+
+    // The prompt is in. Wait until Copilot accepts it (the composer clears), then hand focus
+    // straight back to the user — Copilot stays visible and keeps streaming the reply, which we
+    // read via UIA without needing focus. The user gets their active window back in ~1s instead
+    // of being locked out for the whole reply.
+    for _ in 0..24 {
+        sleep(Duration::from_millis(150));
+        if current_value(&input).trim().is_empty() {
+            break;
+        }
+    }
+    if !user_fg.is_invalid() && user_fg != hwnd {
+        set_foreground(user_fg);
+    }
 
     // Copilot streams its answer; poll until it stabilises (first token can take seconds).
     let mut last = String::new();
@@ -927,6 +968,15 @@ fn main() -> Result<()> {
         "learn" => {
             learn(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
         }
+        "copilot-show" => {
+            match find_visible_window_by_title("Copilot") {
+                Some(h) => {
+                    move_onscreen(h, 60, 60);
+                    println!("Copilotを画面に戻しました。");
+                }
+                None => println!("Copilotウィンドウが見つかりません（起動していますか？）。"),
+            }
+        }
         "update" => {
             updater::check_and_update()?;
         }
@@ -941,6 +991,7 @@ fn main() -> Result<()> {
             println!("  tagami watch            # resident: poll Slack, pop the approval window on new messages");
             println!("  tagami learn            # learn your writing style from past Slack posts -> knowledge.md");
             println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
+            println!("  tagami copilot-show     # bring the (hidden, off-screen) Copilot window back on screen");
             println!("  tagami update           # self-update from the latest GitHub release");
             println!("  tagami version          # show current version");
             println!("  tagami slack-auth       # check Slack auth");

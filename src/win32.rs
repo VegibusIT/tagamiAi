@@ -1,7 +1,7 @@
 //! Win32 window helpers: enumerate windows, read class/title/pid, and "wake"
 //! Chromium/WebView2 accessibility via WM_GETOBJECT.
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VIRTUAL_KEY,
@@ -9,9 +9,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SW_HIDE,
-    SW_RESTORE, WM_GETOBJECT,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow,
+    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE,
+    WM_GETOBJECT,
 };
 
 /// Hide the console window, but only if this process owns it alone (i.e. launched by
@@ -88,6 +89,45 @@ pub fn restore_and_foreground(hwnd: HWND) {
     }
 }
 
+/// The window that currently has user focus (so we can hand it back after driving Copilot).
+pub fn get_foreground_window() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
+/// Make `hwnd` the foreground window WITHOUT moving or restoring it.
+pub fn set_foreground(hwnd: HWND) {
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Bring `hwnd` to a visible position (x, y) and focus it. Used to pull Copilot back on screen
+/// for the brief moment we type into it (and by `copilot-show` if it ever gets parked).
+pub fn move_onscreen(hwnd: HWND, x: i32, y: i32) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Top-left screen position of `hwnd`.
+pub fn window_xy(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        (r.left, r.top)
+    }
+}
+
 /// Find the first visible top-level window whose title contains `substr`.
 pub fn find_visible_window_by_title(substr: &str) -> Option<HWND> {
     enum_top_windows()
@@ -158,11 +198,14 @@ fn vkey(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-/// Press the Enter key (used to submit a chat prompt to the focused input).
+/// Press the Enter key (used to submit a chat prompt to the focused input). The key is held
+/// briefly between down and up: Copilot's WebView2 input drops a zero-duration Enter and the
+/// message never submits.
 pub fn press_enter() {
     unsafe {
-        let inputs = [vkey(VK_RETURN, false), vkey(VK_RETURN, true)];
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        SendInput(&[vkey(VK_RETURN, false)], std::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        SendInput(&[vkey(VK_RETURN, true)], std::mem::size_of::<INPUT>() as i32);
     }
 }
 
