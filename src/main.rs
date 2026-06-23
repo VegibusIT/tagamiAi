@@ -342,6 +342,74 @@ struct Prepared {
     draft: String, // empty when no reply is needed
 }
 
+/// A message worth replying to: a DM, or a channel message that @mentions us.
+struct IncomingTarget {
+    channel: String,
+    text: String,
+    thread_ts: String,
+    ts: f64,
+    mentioned: bool,
+    is_dm: bool,
+}
+
+/// Scan the workspace for the most recent message that is actually directed at us — a DM/group
+/// DM, or a channel message containing our `<@USERID>` mention. Plain channel chatter is ignored
+/// (we don't want to reply to everything), which is what made real mentions get buried before.
+fn find_latest_target(sc: &slack_api::SlackClient, me: &str) -> Result<Option<IncomingTarget>> {
+    let conv = sc.call(
+        "users.conversations",
+        &[
+            ("types", "public_channel,private_channel,im,mpim"),
+            ("limit", "200"),
+            ("exclude_archived", "true"),
+        ],
+    )?;
+    let empty = Vec::new();
+    let channels = conv["channels"].as_array().unwrap_or(&empty);
+    let mention_tag = format!("<@{me}"); // matches both <@U123> and <@U123|name>
+    let mut best: Option<IncomingTarget> = None;
+    for ch in channels.iter().take(50) {
+        let id = match ch["id"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let is_dm =
+            ch["is_im"].as_bool().unwrap_or(false) || ch["is_mpim"].as_bool().unwrap_or(false);
+        let h = match sc.conversations_history(id, 6) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if let Some(msgs) = h["messages"].as_array() {
+            for m in msgs {
+                let u = m["user"].as_str().unwrap_or("");
+                let text = m["text"].as_str().unwrap_or("");
+                let ts_str = m["ts"].as_str().unwrap_or("");
+                let ts: f64 = ts_str.parse().unwrap_or(0.0);
+                if u == me || u.is_empty() || text.trim().is_empty() {
+                    continue;
+                }
+                let mentioned = text.contains(&mention_tag);
+                // Only DMs, or channel messages that mention us, count as something to reply to.
+                if !is_dm && !mentioned {
+                    continue;
+                }
+                if best.as_ref().map_or(true, |b| ts > b.ts) {
+                    let thread_ts = m["thread_ts"].as_str().unwrap_or(ts_str).to_string();
+                    best = Some(IncomingTarget {
+                        channel: id.to_string(),
+                        text: text.to_string(),
+                        thread_ts,
+                        ts,
+                        mentioned,
+                        is_dm,
+                    });
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
 /// Connect, find the most recent incoming message, triage it, and (if needed)
 /// draft a reply as `persona`. Heavy work (Copilot) happens here, before any UI.
 fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<Prepared> {
@@ -354,45 +422,33 @@ fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str
         auth["user"].as_str().unwrap_or("?")
     );
 
-    let conv = sc.call(
-        "users.conversations",
-        &[
-            ("types", "public_channel,private_channel,im,mpim"),
-            ("limit", "200"),
-            ("exclude_archived", "true"),
-        ],
-    )?;
-    let empty = Vec::new();
-    let channels = conv["channels"].as_array().unwrap_or(&empty);
-    let mut best_ts = 0f64;
-    let mut target: Option<(String, String, String)> = None; // (channel, text, thread_ts)
-    for ch in channels.iter().take(30) {
-        let id = match ch["id"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let h = match sc.conversations_history(id, 3) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        if let Some(msgs) = h["messages"].as_array() {
-            for m in msgs {
-                let u = m["user"].as_str().unwrap_or("");
-                let text = m["text"].as_str().unwrap_or("");
-                let ts_str = m["ts"].as_str().unwrap_or("");
-                let ts: f64 = ts_str.parse().unwrap_or(0.0);
-                if u != me && !text.trim().is_empty() && ts > best_ts {
-                    best_ts = ts;
-                    let thread_ts = m["thread_ts"].as_str().unwrap_or(ts_str).to_string();
-                    target = Some((id.to_string(), text.to_string(), thread_ts));
-                }
-            }
-        }
-    }
-    let (channel, msg, thread_ts) =
-        target.ok_or_else(|| anyhow!("no incoming message found in workspace"))?;
-    println!("[最新の受信] ch={} : {}", channel, truncate(&msg, 140));
-    let msg = truncate(&msg, 500);
+    let target = find_latest_target(&sc, &me)?
+        .ok_or_else(|| anyhow!("返信対象（DM・または自分宛メンション）が見つかりませんでした"))?;
+    let channel = target.channel.clone();
+    let thread_ts = target.thread_ts.clone();
+    let kind = if target.mentioned {
+        "メンション"
+    } else if target.is_dm {
+        "DM"
+    } else {
+        "メッセージ"
+    };
+    println!(
+        "[最新の受信] ch={} 種別={} : {}",
+        channel,
+        kind,
+        truncate(&target.text, 140)
+    );
+    let msg = truncate(&target.text, 500);
+    // Tell Copilot when the message is explicitly aimed at the user, so triage doesn't dismiss
+    // a direct ping as "どうでもいい内容".
+    let direct_note = if target.mentioned {
+        "（これはあなた（本人）宛の@メンションです。基本的に何らかの返信をしてください）"
+    } else if target.is_dm {
+        "（これはあなた宛のダイレクトメッセージです）"
+    } else {
+        ""
+    };
 
     // Knowledge base (Drive) — facts the AI may rely on; stops it inventing schedules.
     let knowledge = std::fs::read_to_string(knowledge_path).unwrap_or_default();
@@ -407,7 +463,7 @@ fn prepare_reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str
 
     // Single combined call (judgment + draft) to halve Copilot usage (free quota).
     let prompt = format!(
-        "{knowledge_block}あなたは『{persona}』本人です。次のSlackメッセージへの対応を決めてください。\
+        "{knowledge_block}あなたは『{persona}』本人です。次のSlackメッセージへの対応を決めてください。{direct_note}\
          返信すべきでない（挨拶のみ・雑談・自動通知・どうでもいい内容）なら、出力は『返信不要』だけにしてください。\
          返信すべきなら、1行目に『返信必要』と書き、2行目以降に返信本文だけを書いてください\
          （前置き・解説・引用符なし。予定・可否・事実など自分が確実に知らないことは推測で断定せず、『確認して折り返します』等の確認形に）。\n\nメッセージ:\n{msg}"
@@ -458,7 +514,8 @@ fn reply(uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str, send: 
 }
 
 /// GUI path: open a local browser page so the human can review/edit/approve before sending.
-/// Cheap Slack-only poll: ts of the most recent incoming message (no Copilot used).
+/// Cheap Slack-only poll: ts of the most recent message actually aimed at us (DM or @mention),
+/// so the watcher wakes on the same thing `prepare_reply` will answer — not on channel chatter.
 fn latest_incoming_ts(subdomain: &str) -> Result<f64> {
     let sc = slack_api::SlackClient::connect(subdomain)?;
     let me = sc
@@ -466,37 +523,7 @@ fn latest_incoming_ts(subdomain: &str) -> Result<f64> {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let conv = sc.call(
-        "users.conversations",
-        &[
-            ("types", "public_channel,private_channel,im,mpim"),
-            ("limit", "200"),
-            ("exclude_archived", "true"),
-        ],
-    )?;
-    let empty = Vec::new();
-    let channels = conv["channels"].as_array().unwrap_or(&empty);
-    let mut best = 0f64;
-    for ch in channels.iter().take(30) {
-        let id = match ch["id"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let h = match sc.conversations_history(id, 1) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        if let Some(msgs) = h["messages"].as_array() {
-            for m in msgs {
-                let u = m["user"].as_str().unwrap_or("");
-                let ts: f64 = m["ts"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                if u != me && ts > best {
-                    best = ts;
-                }
-            }
-        }
-    }
-    Ok(best)
+    Ok(find_latest_target(&sc, &me)?.map(|t| t.ts).unwrap_or(0.0))
 }
 
 /// Resident watcher: poll Slack (API only); when a message newer than startup arrives,
