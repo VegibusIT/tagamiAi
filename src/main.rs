@@ -534,6 +534,72 @@ fn activity_log_dir(knowledge_path: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("activity"))
 }
 
+/// Shareable reports folder on Drive — kept separate from the raw `activity` logs so the user
+/// can share just this folder with 田上 once and have every report flow to them automatically.
+fn reports_dir(knowledge_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(knowledge_path)
+        .parent()
+        .map(|p| p.join("レポート"))
+        .unwrap_or_else(|| std::path::PathBuf::from("レポート"))
+}
+
+/// Write a combined, human-readable report (work breakdown + optional automation candidates)
+/// into the shared reports folder on Drive; returns the file path.
+fn write_shared_report(
+    knowledge_path: &str,
+    date: &str,
+    breakdown: &str,
+    automation: Option<&str>,
+) -> std::path::PathBuf {
+    let dir = reports_dir(knowledge_path);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut body = String::from(breakdown);
+    if let Some(a) = automation {
+        body.push_str("\n\n== 自動化できそうな作業（Copilot提案） ==\n");
+        body.push_str(a);
+    }
+    let path = dir.join(format!("{date} 作業レポート.txt"));
+    let _ = std::fs::write(&path, body);
+    path
+}
+
+/// Path of the logon-autostart launcher in the user's Startup folder.
+fn autostart_path() -> std::path::PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    std::path::PathBuf::from(appdata)
+        .join("Microsoft\\Windows\\Start Menu\\Programs\\Startup")
+        .join("AItagami.vbs")
+}
+
+/// Whether AI田上 is set to start the resident watcher at logon.
+fn autostart_enabled() -> bool {
+    autostart_path().exists()
+}
+
+/// Enable/disable logon autostart by writing (or removing) a tiny .vbs that launches
+/// `tagami watch` hidden. The .vbs is UTF-16LE+BOM so a Japanese exe path survives.
+fn set_autostart(enable: bool) -> Result<()> {
+    let path = autostart_path();
+    if enable {
+        let exe = std::env::current_exe()?;
+        let script = format!(
+            "Set s = CreateObject(\"WScript.Shell\")\r\ns.Run \"\"\"{}\"\" watch\", 0, False\r\n",
+            exe.display()
+        );
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for u in script.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::write(&path, bytes)?;
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
 /// Sample the foreground app every ~10s and append (only when it changes) one TSV line to
 /// today's log: `epoch \t YYYY-MM-DD HH:MM:SS \t app \t title`. Idle stretches (no input for
 /// >150s) are logged as "(idle)" so time away from the desk isn't counted as work.
@@ -665,14 +731,15 @@ fn report(
         .unwrap_or_else(|| win32::local_now().0);
     let out = aggregate_activity(knowledge_path, persona, &day)?;
     println!("{out}");
-    let dir = activity_log_dir(knowledge_path);
-    let _ = std::fs::write(dir.join(format!("report-{day}.txt")), &out);
+    let mut automation: Option<String> = None;
     if ai {
         println!("\nCopilotに自動化候補を抽出させています…");
         let resp = copilot_send_and_read(uia, &automation_prompt(persona, &out))?;
         println!("\n== 自動化候補（Copilot）==\n{resp}");
-        let _ = std::fs::write(dir.join(format!("automation-{day}.txt")), &resp);
+        automation = Some(resp);
     }
+    let path = write_shared_report(knowledge_path, &day, &out, automation.as_deref());
+    println!("→ Driveの共有フォルダに保存: {}", path.display());
     Ok(())
 }
 
@@ -1060,6 +1127,7 @@ impl GuiApp {
                     aggregate_activity(&self.knowledge_path, &self.persona, self.r_date.trim())
                         .unwrap_or_else(|e| e.to_string());
                 self.r_ai.clear();
+                write_shared_report(&self.knowledge_path, self.r_date.trim(), &self.r_text, None);
             }
             if ui
                 .add_enabled(!self.r_loading, egui::Button::new("🤖 自動化候補を出す"))
@@ -1074,6 +1142,16 @@ impl GuiApp {
                     .unwrap_or_else(|e| e.to_string());
                 }
                 self.start_report_ai();
+            }
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let dir = reports_dir(&self.knowledge_path);
+            ui.label("共有フォルダ(Drive):");
+            ui.monospace(dir.display().to_string());
+            if ui.button("📁 開く").clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
             }
         });
         if !self.r_msg.is_empty() {
@@ -1131,6 +1209,21 @@ impl GuiApp {
             ui.label("Slack確認の間隔（秒・最小30）:");
             ui.text_edit_singleline(&mut self.s_interval);
         });
+        ui.add_space(8.0);
+        let mut auto = autostart_enabled();
+        if ui
+            .checkbox(
+                &mut auto,
+                "PC起動時に自動で常駐する（メンション監視＋活動記録）",
+            )
+            .changed()
+        {
+            self.settings_msg = match set_autostart(auto) {
+                Ok(_) if auto => "自動起動を設定しました（次回ログインから有効）".to_owned(),
+                Ok(_) => "自動起動を解除しました".to_owned(),
+                Err(e) => format!("自動起動の設定に失敗: {e}"),
+            };
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("保存").clicked() {
@@ -1285,10 +1378,11 @@ impl eframe::App for GuiApp {
                         self.r_loading = false;
                         self.r_rx = None;
                         self.r_msg.clear();
-                        let dir = activity_log_dir(&self.knowledge_path);
-                        let _ = std::fs::write(
-                            dir.join(format!("automation-{}.txt", self.r_date.trim())),
-                            &self.r_ai,
+                        write_shared_report(
+                            &self.knowledge_path,
+                            self.r_date.trim(),
+                            &self.r_text,
+                            Some(&self.r_ai),
                         );
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
@@ -1387,6 +1481,15 @@ fn main() -> Result<()> {
         "activity" => {
             activity(&cfg.knowledge_path)?;
         }
+        "autostart" => {
+            let on = args.get(2).map(|s| s != "off").unwrap_or(true);
+            set_autostart(on)?;
+            println!(
+                "ログイン時の自動起動: {}（{}）",
+                if on { "ON" } else { "OFF" },
+                autostart_path().display()
+            );
+        }
         "report" => {
             let date = args.get(2).filter(|a| !a.starts_with("--")).map(String::as_str);
             let ai = args.iter().any(|a| a == "--ai");
@@ -1419,6 +1522,7 @@ fn main() -> Result<()> {
             println!("  tagami learn            # learn your writing style from past Slack posts -> knowledge.md");
             println!("  tagami activity         # resident: log which app/window you use over time -> Drive");
             println!("  tagami report [date] [--ai]  # summarise a day's activity (--ai: Copilot suggests automation)");
+            println!("  tagami autostart [on|off]    # start the resident watcher automatically at logon");
             println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
             println!("  tagami copilot-show     # bring the (hidden, off-screen) Copilot window back on screen");
             println!("  tagami update           # self-update from the latest GitHub release");
