@@ -580,23 +580,14 @@ fn activity(knowledge_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Aggregate a day's activity log into a report (time per app, top windows). With `ai`, also
-/// ask Copilot which repetitive tasks look automatable.
-fn report(
-    uia: &Uia,
-    knowledge_path: &str,
-    persona: &str,
-    date: Option<&str>,
-    ai: bool,
-) -> Result<()> {
+/// Aggregate a day's activity log into a human-readable report (time per app, top windows).
+/// Returned as a string so both the CLI and the GUI can show/save it.
+fn aggregate_activity(knowledge_path: &str, persona: &str, date: &str) -> Result<String> {
     let dir = activity_log_dir(knowledge_path);
-    let day = date
-        .map(String::from)
-        .unwrap_or_else(|| win32::local_now().0);
-    let path = dir.join(format!("{day}.tsv"));
+    let path = dir.join(format!("{date}.tsv"));
     let txt = std::fs::read_to_string(&path).map_err(|_| {
         anyhow!(
-            "活動ログがありません: {}（まず `tagami activity` か常駐で記録してください）",
+            "活動ログがありません: {}（まず記録を溜めてください）",
             path.display()
         )
     })?;
@@ -612,11 +603,10 @@ fn report(
         }
     }
     if entries.len() < 2 {
-        println!(
-            "{day} の記録が少なすぎます（{}件）。しばらく記録してから再実行してください。",
+        return Ok(format!(
+            "{date} の記録が少なすぎます（{}件）。しばらく記録してから見てください。",
             entries.len()
-        );
-        return Ok(());
+        ));
     }
     let mut per_app: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut per_title: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -642,7 +632,7 @@ fn report(
     titles.sort_by(|a, b| b.1.cmp(a.1));
 
     let mut out = String::new();
-    out.push_str(&format!("== {day} 作業レポート（{persona}） ==\n"));
+    out.push_str(&format!("== {date} 作業レポート（{persona}） ==\n"));
     out.push_str(&format!("アクティブ合計: {}\n\n[アプリ別]\n", fmt(active)));
     for (a, s) in apps.iter().take(15) {
         out.push_str(&format!("  {:<7}  {}\n", fmt(**s), a));
@@ -651,22 +641,37 @@ fn report(
     for (t, s) in titles.iter().take(25) {
         out.push_str(&format!("  {:<7}  {}\n", fmt(**s), truncate(t, 80)));
     }
-    println!("{out}");
-    let report_path = dir.join(format!("report-{day}.txt"));
-    let _ = std::fs::write(&report_path, &out);
-    println!("→ 保存: {}", report_path.display());
+    Ok(out)
+}
 
+/// The Copilot prompt that turns an activity report into automation candidates.
+fn automation_prompt(persona: &str, report_text: &str) -> String {
+    format!(
+        "以下は『{persona}』のPC作業ログの集計です。ここから、繰り返し・定型で\u{201c}自動化できそうな作業\u{201d}を重要な順に箇条書きで挙げてください。\
+         各項目は『作業内容 → 自動化の方針』の形で1〜2行にし、推測しすぎず、どのアプリ/ウィンドウから読み取れるかの根拠も短く添えてください。\n\n{report_text}"
+    )
+}
+
+/// CLI: print the day's report; with `--ai` also ask Copilot for automation candidates.
+fn report(
+    uia: &Uia,
+    knowledge_path: &str,
+    persona: &str,
+    date: Option<&str>,
+    ai: bool,
+) -> Result<()> {
+    let day = date
+        .map(String::from)
+        .unwrap_or_else(|| win32::local_now().0);
+    let out = aggregate_activity(knowledge_path, persona, &day)?;
+    println!("{out}");
+    let dir = activity_log_dir(knowledge_path);
+    let _ = std::fs::write(dir.join(format!("report-{day}.txt")), &out);
     if ai {
-        let prompt = format!(
-            "以下は『{persona}』のPC作業ログの集計です。ここから、繰り返し・定型で\u{201c}自動化できそうな作業\u{201d}を重要な順に箇条書きで挙げてください。\
-             各項目は『作業内容 → 自動化の方針』の形で1〜2行にし、推測しすぎず、どのアプリ/ウィンドウから読み取れるかの根拠も短く添えてください。\n\n{out}"
-        );
         println!("\nCopilotに自動化候補を抽出させています…");
-        let resp = copilot_send_and_read(uia, &prompt)?;
+        let resp = copilot_send_and_read(uia, &automation_prompt(persona, &out))?;
         println!("\n== 自動化候補（Copilot）==\n{resp}");
-        let cand_path = dir.join(format!("automation-{day}.txt"));
-        let _ = std::fs::write(&cand_path, &resp);
-        println!("→ 保存: {}", cand_path.display());
+        let _ = std::fs::write(dir.join(format!("automation-{day}.txt")), &resp);
     }
     Ok(())
 }
@@ -827,31 +832,16 @@ fn update_knowledge_section(path: &str, header: &str, body: &str) -> Result<()> 
 
 /// Launch the desktop window immediately (showing "準備中…") and do the slow
 /// Slack+Copilot work on a background thread so the user always sees a GUI.
-fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -> Result<()> {
+/// The desktop app. `auto` = launched by the watcher for a fresh message → go straight to the
+/// reply view and start loading; otherwise (double-click) show the Home menu.
+fn reply_gui(persona: &str, subdomain: &str, knowledge_path: &str, auto: bool) -> Result<()> {
     win32::hide_console_if_owned();
-
-    let (tx, rx) = std::sync::mpsc::channel::<PrepMsg>();
-    {
-        let persona = persona.to_owned();
-        let subdomain = subdomain.to_owned();
-        let knowledge_path = knowledge_path.to_owned();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<PrepMsg> {
-                let uia = Uia::new()?; // own COM/UIA on this thread
-                let p = prepare_reply(&uia, &persona, &subdomain, &knowledge_path)?;
-                if p.draft.trim().is_empty() {
-                    Ok(PrepMsg::NoReply(p.judgment))
-                } else {
-                    Ok(PrepMsg::Ready(Box::new(p)))
-                }
-            })();
-            let _ = tx.send(result.unwrap_or_else(|e| PrepMsg::Error(e.to_string())));
-        });
-    }
-
-    let app = GuiApp {
+    let mut app = GuiApp {
         persona: persona.to_owned(),
-        rx,
+        subdomain: subdomain.to_owned(),
+        knowledge_path: knowledge_path.to_owned(),
+        view: if auto { View::Reply } else { View::Home },
+        rx: None,
         stage: Stage::Loading,
         incoming: String::new(),
         judgment: String::new(),
@@ -862,21 +852,29 @@ fn reply_gui(_uia: &Uia, persona: &str, subdomain: &str, knowledge_path: &str) -
         status: String::new(),
         error: String::new(),
         done: false,
-        settings_open: false,
+        r_date: win32::local_now().0,
+        r_text: String::new(),
+        r_ai: String::new(),
+        r_loading: false,
+        r_rx: None,
+        r_msg: String::new(),
         s_persona: persona.to_owned(),
         s_subdomain: subdomain.to_owned(),
         s_knowledge: knowledge_path.to_owned(),
         s_interval: config::Config::load().watch_interval_secs.to_string(),
         settings_msg: String::new(),
     };
+    if auto {
+        app.start_reply_load();
+    }
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 640.0])
+            .with_inner_size([760.0, 680.0])
             .with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native(
-        "AI田上 返信確認",
+        "AI田上",
         opts,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
@@ -932,9 +930,21 @@ enum Stage {
     Error,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Home,
+    Reply,
+    Report,
+    Settings,
+}
+
 struct GuiApp {
     persona: String,
-    rx: std::sync::mpsc::Receiver<PrepMsg>,
+    subdomain: String,
+    knowledge_path: String,
+    view: View,
+    // reply flow
+    rx: Option<std::sync::mpsc::Receiver<PrepMsg>>,
     stage: Stage,
     incoming: String,
     judgment: String,
@@ -945,8 +955,14 @@ struct GuiApp {
     status: String,
     error: String,
     done: bool,
+    // report view
+    r_date: String,
+    r_text: String,
+    r_ai: String,
+    r_loading: bool,
+    r_rx: Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
+    r_msg: String,
     // settings editor
-    settings_open: bool,
     s_persona: String,
     s_subdomain: String,
     s_knowledge: String,
@@ -954,158 +970,382 @@ struct GuiApp {
     settings_msg: String,
 }
 
+impl GuiApp {
+    /// Spawn the (Slack + Copilot) reply preparation on a background thread.
+    fn start_reply_load(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<PrepMsg>();
+        let (persona, subdomain, knowledge) = (
+            self.persona.clone(),
+            self.subdomain.clone(),
+            self.knowledge_path.clone(),
+        );
+        std::thread::spawn(move || {
+            let result = (|| -> Result<PrepMsg> {
+                let uia = Uia::new()?; // own COM/UIA on this thread
+                let p = prepare_reply(&uia, &persona, &subdomain, &knowledge)?;
+                if p.draft.trim().is_empty() {
+                    Ok(PrepMsg::NoReply(p.judgment))
+                } else {
+                    Ok(PrepMsg::Ready(Box::new(p)))
+                }
+            })();
+            let _ = tx.send(result.unwrap_or_else(|e| PrepMsg::Error(e.to_string())));
+        });
+        self.rx = Some(rx);
+        self.stage = Stage::Loading;
+        self.error.clear();
+        self.status.clear();
+        self.done = false;
+    }
+
+    /// Spawn (aggregate + Copilot) automation-candidate extraction on a background thread.
+    fn start_report_ai(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+        let (persona, knowledge, date) = (
+            self.persona.clone(),
+            self.knowledge_path.clone(),
+            self.r_date.trim().to_owned(),
+        );
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let uia = Uia::new()?;
+                let out = aggregate_activity(&knowledge, &persona, &date)?;
+                copilot_send_and_read(&uia, &automation_prompt(&persona, &out))
+            })();
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        self.r_rx = Some(rx);
+        self.r_loading = true;
+        self.r_msg = "Copilotで自動化候補を抽出中…（30〜60秒）".to_owned();
+    }
+
+    fn ui_home(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui;
+        ui.add_space(12.0);
+        ui.label("やりたいことを選んでください。");
+        ui.add_space(14.0);
+        let big = egui::vec2(320.0, 40.0);
+        if ui
+            .add(egui::Button::new("✉   Slackの返信を確認する").min_size(big))
+            .clicked()
+        {
+            self.view = View::Reply;
+            if self.rx.is_none() {
+                self.start_reply_load();
+            }
+        }
+        ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new("📊   今日の作業レポートを見る").min_size(big))
+            .clicked()
+        {
+            self.view = View::Report;
+            self.r_text =
+                aggregate_activity(&self.knowledge_path, &self.persona, self.r_date.trim())
+                    .unwrap_or_else(|e| e.to_string());
+        }
+        ui.add_space(8.0);
+        if ui.add(egui::Button::new("⚙   設定").min_size(big)).clicked() {
+            self.view = View::Settings;
+        }
+    }
+
+    fn ui_report(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui;
+        ui.horizontal(|ui| {
+            ui.label("日付:");
+            ui.add(egui::TextEdit::singleline(&mut self.r_date).desired_width(110.0));
+            if ui.button("集計").clicked() {
+                self.r_text =
+                    aggregate_activity(&self.knowledge_path, &self.persona, self.r_date.trim())
+                        .unwrap_or_else(|e| e.to_string());
+                self.r_ai.clear();
+            }
+            if ui
+                .add_enabled(!self.r_loading, egui::Button::new("🤖 自動化候補を出す"))
+                .clicked()
+            {
+                if self.r_text.is_empty() {
+                    self.r_text = aggregate_activity(
+                        &self.knowledge_path,
+                        &self.persona,
+                        self.r_date.trim(),
+                    )
+                    .unwrap_or_else(|e| e.to_string());
+                }
+                self.start_report_ai();
+            }
+        });
+        if !self.r_msg.is_empty() {
+            ui.add_space(4.0);
+            if self.r_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&self.r_msg);
+                });
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(0xcc, 0x55, 0x55), &self.r_msg);
+            }
+        }
+        ui.add_space(6.0);
+        let report_h = if self.r_ai.is_empty() { 470.0 } else { 210.0 };
+        egui::ScrollArea::vertical()
+            .id_source("report")
+            .max_height(report_h)
+            .show(ui, |ui| {
+                ui.monospace(if self.r_text.is_empty() {
+                    "「集計」を押すと、その日の作業内訳（アプリ別・上位の作業）が出ます。\n「🤖 自動化候補を出す」でCopilotが自動化できそうな作業を提案します。"
+                } else {
+                    self.r_text.as_str()
+                });
+            });
+        if !self.r_ai.is_empty() {
+            ui.add_space(6.0);
+            ui.label("🤖 自動化できそうな作業（Copilot）:");
+            egui::ScrollArea::vertical()
+                .id_source("ai")
+                .max_height(250.0)
+                .show(ui, |ui| {
+                    ui.label(&self.r_ai);
+                });
+        }
+    }
+
+    fn ui_settings(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui;
+        ui.label("設定（保存すると次回起動から反映されます）");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("返信の主体（アカウント名）:");
+            ui.text_edit_singleline(&mut self.s_persona);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Slackワークスペース（サブドメイン）:");
+            ui.text_edit_singleline(&mut self.s_subdomain);
+        });
+        ui.add_space(4.0);
+        ui.label("知識ベースの保存場所（ファイルパス）:");
+        ui.add(egui::TextEdit::singleline(&mut self.s_knowledge).desired_width(f32::INFINITY));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Slack確認の間隔（秒・最小30）:");
+            ui.text_edit_singleline(&mut self.s_interval);
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("保存").clicked() {
+                let c = config::Config {
+                    persona: self.s_persona.trim().to_owned(),
+                    slack_subdomain: self.s_subdomain.trim().to_owned(),
+                    knowledge_path: self.s_knowledge.trim().to_owned(),
+                    watch_interval_secs: self.s_interval.trim().parse().unwrap_or(180),
+                };
+                self.settings_msg = match c.save() {
+                    Ok(_) => "保存しました（次回起動から反映）".to_owned(),
+                    Err(e) => format!("保存失敗: {e}"),
+                };
+            }
+            if ui.button("ホームへ").clicked() {
+                self.view = View::Home;
+            }
+        });
+        if !self.settings_msg.is_empty() {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.settings_msg);
+        }
+    }
+
+    fn ui_reply(&mut self, ui: &mut eframe::egui::Ui, ctx: &eframe::egui::Context) {
+        use eframe::egui;
+        if self.rx.is_none() {
+            ui.add_space(16.0);
+            ui.label("最新のあなた宛メッセージ（メンション/DM）から返信案を作ります。");
+            ui.add_space(8.0);
+            if ui.button("返信案を作成（30〜60秒）").clicked() {
+                self.start_reply_load();
+            }
+            return;
+        }
+        match self.stage {
+            Stage::Loading => {
+                ui.add_space(24.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("準備中… Slack取得・AI判断・返信生成（30〜60秒ほど）");
+                });
+            }
+            Stage::Error => {
+                ui.colored_label(egui::Color32::RED, format!("エラー: {}", self.error));
+                ui.add_space(6.0);
+                if ui.button("再試行").clicked() {
+                    self.start_reply_load();
+                }
+            }
+            Stage::NoReply => {
+                ui.label(format!("AIの判断: {}", self.judgment));
+                ui.add_space(6.0);
+                ui.label("→ 返信不要と判断。送信する返信はありません。");
+                ui.add_space(6.0);
+                if ui.button("もう一度確認").clicked() {
+                    self.start_reply_load();
+                }
+            }
+            Stage::Ready => {
+                ui.label("受信メッセージ:");
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(&self.incoming);
+                });
+                ui.add_space(4.0);
+                ui.label(format!("AIの判断: {}", self.judgment));
+                ui.add_space(6.0);
+                ui.label("返信案（編集できます）:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.draft)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.done, egui::Button::new("スレッドに送信"))
+                        .clicked()
+                    {
+                        if let Some(sc) = &self.sc {
+                            match sc.post_message(&self.channel, &self.draft, Some(&self.thread_ts)) {
+                                Ok(j) => self.status = format!("送信しました（ok={}）", j["ok"]),
+                                Err(e) => self.status = format!("送信エラー: {e}"),
+                            }
+                            self.done = true;
+                        }
+                    }
+                    if ui
+                        .add_enabled(!self.done, egui::Button::new("送らない"))
+                        .clicked()
+                    {
+                        self.status = "送信しませんでした。".to_owned();
+                        self.done = true;
+                    }
+                    if self.done && ui.button("閉じる").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                if !self.status.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.status);
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
+
+        // Reply preparation result (background thread).
         if self.stage == Stage::Loading {
-            match self.rx.try_recv() {
-                Ok(PrepMsg::Ready(p)) => {
-                    let p = *p;
-                    self.incoming = p.incoming;
-                    self.judgment = p.judgment;
-                    self.draft = p.draft;
-                    self.channel = p.channel;
-                    self.thread_ts = p.thread_ts;
-                    self.sc = Some(p.sc);
-                    self.stage = Stage::Ready;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if let Some(rx) = &self.rx {
+                match rx.try_recv() {
+                    Ok(PrepMsg::Ready(p)) => {
+                        let p = *p;
+                        self.incoming = p.incoming;
+                        self.judgment = p.judgment;
+                        self.draft = p.draft;
+                        self.channel = p.channel;
+                        self.thread_ts = p.thread_ts;
+                        self.sc = Some(p.sc);
+                        self.stage = Stage::Ready;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    Ok(PrepMsg::NoReply(j)) => {
+                        self.judgment = j;
+                        self.stage = Stage::NoReply;
+                    }
+                    Ok(PrepMsg::Error(e)) => {
+                        self.error = e;
+                        self.stage = Stage::Error;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.error = "準備処理が異常終了しました".to_owned();
+                        self.stage = Stage::Error;
+                    }
                 }
-                Ok(PrepMsg::NoReply(j)) => {
-                    self.judgment = j;
-                    self.stage = Stage::NoReply;
-                }
-                Ok(PrepMsg::Error(e)) => {
-                    self.error = e;
-                    self.stage = Stage::Error;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.error = "準備処理が異常終了しました".to_owned();
-                    self.stage = Stage::Error;
+            }
+        }
+
+        // Automation-candidate result (background thread).
+        if self.r_loading {
+            if let Some(rx) = &self.r_rx {
+                match rx.try_recv() {
+                    Ok(Ok(resp)) => {
+                        self.r_ai = resp;
+                        self.r_loading = false;
+                        self.r_rx = None;
+                        self.r_msg.clear();
+                        let dir = activity_log_dir(&self.knowledge_path);
+                        let _ = std::fs::write(
+                            dir.join(format!("automation-{}.txt", self.r_date.trim())),
+                            &self.r_ai,
+                        );
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    Ok(Err(e)) => {
+                        self.r_msg = format!("エラー: {e}");
+                        self.r_loading = false;
+                        self.r_rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.r_msg = "処理が異常終了しました".to_owned();
+                        self.r_loading = false;
+                        self.r_rx = None;
+                    }
                 }
             }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(format!("AI田上（{} として）", self.persona));
+                ui.heading("AI田上");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ 設定").clicked() {
-                        self.settings_open = !self.settings_open;
+                    if ui
+                        .selectable_label(self.view == View::Settings, "⚙ 設定")
+                        .clicked()
+                    {
+                        self.view = View::Settings;
+                    }
+                    if ui
+                        .selectable_label(self.view == View::Report, "📊 レポート")
+                        .clicked()
+                    {
+                        self.view = View::Report;
+                    }
+                    if ui
+                        .selectable_label(self.view == View::Reply, "✉ 返信")
+                        .clicked()
+                    {
+                        self.view = View::Reply;
+                    }
+                    if ui
+                        .selectable_label(self.view == View::Home, "🏠 ホーム")
+                        .clicked()
+                    {
+                        self.view = View::Home;
                     }
                 });
             });
             ui.separator();
 
-            if self.settings_open {
-                ui.label("設定（保存すると次回起動から反映されます）");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("返信の主体（アカウント名）:");
-                    ui.text_edit_singleline(&mut self.s_persona);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Slackワークスペース（サブドメイン）:");
-                    ui.text_edit_singleline(&mut self.s_subdomain);
-                });
-                ui.add_space(4.0);
-                ui.label("知識ベースの保存場所（ファイルパス）:");
-                ui.add(egui::TextEdit::singleline(&mut self.s_knowledge).desired_width(f32::INFINITY));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Slack確認の間隔（秒・最小30）:");
-                    ui.text_edit_singleline(&mut self.s_interval);
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存").clicked() {
-                        let c = config::Config {
-                            persona: self.s_persona.trim().to_owned(),
-                            slack_subdomain: self.s_subdomain.trim().to_owned(),
-                            knowledge_path: self.s_knowledge.trim().to_owned(),
-                            watch_interval_secs: self.s_interval.trim().parse().unwrap_or(180),
-                        };
-                        self.settings_msg = match c.save() {
-                            Ok(_) => "保存しました（次回起動から反映）".to_owned(),
-                            Err(e) => format!("保存失敗: {e}"),
-                        };
-                    }
-                    if ui.button("戻る").clicked() {
-                        self.settings_open = false;
-                    }
-                });
-                if !self.settings_msg.is_empty() {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.settings_msg);
-                }
-                return;
-            }
-
-            match self.stage {
-                Stage::Loading => {
-                    ui.add_space(24.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("準備中… Slack取得・AI判断・返信生成（30〜60秒ほど）");
-                    });
-                }
-                Stage::Error => {
-                    ui.colored_label(egui::Color32::RED, format!("エラー: {}", self.error));
-                }
-                Stage::NoReply => {
-                    ui.label(format!("AIの判断: {}", self.judgment));
-                    ui.add_space(6.0);
-                    ui.label("→ 返信不要と判断。送信する返信はありません。");
-                    if ui.button("閉じる").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-                Stage::Ready => {
-                    ui.label("受信メッセージ:");
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.label(&self.incoming);
-                    });
-                    ui.add_space(4.0);
-                    ui.label(format!("AIの判断: {}", self.judgment));
-                    ui.add_space(6.0);
-                    ui.label("返信案（編集できます）:");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.draft)
-                            .desired_rows(8)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.done, egui::Button::new("スレッドに送信"))
-                            .clicked()
-                        {
-                            if let Some(sc) = &self.sc {
-                                match sc.post_message(&self.channel, &self.draft, Some(&self.thread_ts)) {
-                                    Ok(j) => self.status = format!("送信しました（ok={}）", j["ok"]),
-                                    Err(e) => self.status = format!("送信エラー: {e}"),
-                                }
-                                self.done = true;
-                            }
-                        }
-                        if ui
-                            .add_enabled(!self.done, egui::Button::new("送らない"))
-                            .clicked()
-                        {
-                            self.status = "送信しませんでした。".to_owned();
-                            self.done = true;
-                        }
-                        if self.done && ui.button("閉じる").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                    if !self.status.is_empty() {
-                        ui.add_space(8.0);
-                        ui.colored_label(egui::Color32::from_rgb(0x2e, 0xb6, 0x7d), &self.status);
-                    }
-                }
+            match self.view {
+                View::Home => self.ui_home(ui),
+                View::Reply => self.ui_reply(ui, ctx),
+                View::Report => self.ui_report(ui),
+                View::Settings => self.ui_settings(ui),
             }
         });
     }
@@ -1138,7 +1378,8 @@ fn main() -> Result<()> {
             reply(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path, send)?;
         }
         "reply-gui" => {
-            reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
+            // Launched by the watcher for a fresh message → go straight to the reply view.
+            reply_gui(&cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path, true)?;
         }
         "watch" => {
             watch(&cfg.slack_subdomain, cfg.watch_interval_secs, &cfg.knowledge_path)?;
@@ -1185,8 +1426,8 @@ fn main() -> Result<()> {
             println!("  tagami slack-auth       # check Slack auth");
         }
         _ => {
-            // No argument (e.g. double-click) or unknown command: open the desktop GUI.
-            reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
+            // No argument (e.g. double-click) or unknown command: open the desktop GUI home.
+            reply_gui(&cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path, false)?;
         }
     }
     Ok(())
