@@ -526,11 +526,159 @@ fn latest_incoming_ts(subdomain: &str) -> Result<f64> {
     Ok(find_latest_target(&sc, &me)?.map(|t| t.ts).unwrap_or(0.0))
 }
 
+/// Where the daily activity logs live: next to the knowledge base on Drive.
+fn activity_log_dir(knowledge_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(knowledge_path)
+        .parent()
+        .map(|p| p.join("activity"))
+        .unwrap_or_else(|| std::path::PathBuf::from("activity"))
+}
+
+/// Sample the foreground app every ~10s and append (only when it changes) one TSV line to
+/// today's log: `epoch \t YYYY-MM-DD HH:MM:SS \t app \t title`. Idle stretches (no input for
+/// >150s) are logged as "(idle)" so time away from the desk isn't counted as work.
+fn activity_loop(dir: std::path::PathBuf) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(&dir);
+    let mut last_key = String::new();
+    let mut last_write = 0u64;
+    loop {
+        let idle = win32::idle_seconds();
+        let (date, time, epoch) = win32::local_now();
+        let (app, title) = if idle >= 150 {
+            ("(idle)".to_string(), String::new())
+        } else {
+            let (a, t) = win32::foreground_app_title();
+            let clean = |s: String| s.replace(['\t', '\r', '\n'], " ");
+            (clean(a), truncate(&clean(t), 120))
+        };
+        let key = format!("{app}\u{1}{title}");
+        // Log on every change, plus a heartbeat every 5 min so a long single-window session
+        // still accumulates duration (and report can cap each gap at 5 min).
+        if !app.is_empty() && (key != last_key || epoch.saturating_sub(last_write) >= 300) {
+            last_key = key;
+            last_write = epoch;
+            let line = format!("{epoch}\t{date} {time}\t{app}\t{title}\n");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{date}.tsv")))
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        sleep(Duration::from_secs(10));
+    }
+}
+
+/// Standalone resident activity logger (the watcher also runs this in a thread).
+fn activity(knowledge_path: &str) -> Result<()> {
+    win32::hide_console_if_owned();
+    let dir = activity_log_dir(knowledge_path);
+    println!("活動ログを記録します（停止は Ctrl+C / プロセス終了） → {}", dir.display());
+    activity_loop(dir);
+    Ok(())
+}
+
+/// Aggregate a day's activity log into a report (time per app, top windows). With `ai`, also
+/// ask Copilot which repetitive tasks look automatable.
+fn report(
+    uia: &Uia,
+    knowledge_path: &str,
+    persona: &str,
+    date: Option<&str>,
+    ai: bool,
+) -> Result<()> {
+    let dir = activity_log_dir(knowledge_path);
+    let day = date
+        .map(String::from)
+        .unwrap_or_else(|| win32::local_now().0);
+    let path = dir.join(format!("{day}.tsv"));
+    let txt = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow!(
+            "活動ログがありません: {}（まず `tagami activity` か常駐で記録してください）",
+            path.display()
+        )
+    })?;
+    let mut entries: Vec<(u64, String, String)> = Vec::new();
+    for line in txt.lines() {
+        let mut it = line.splitn(4, '\t');
+        let epoch: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let _ts = it.next();
+        let app = it.next().unwrap_or("").to_string();
+        let title = it.next().unwrap_or("").to_string();
+        if epoch > 0 {
+            entries.push((epoch, app, title));
+        }
+    }
+    if entries.len() < 2 {
+        println!(
+            "{day} の記録が少なすぎます（{}件）。しばらく記録してから再実行してください。",
+            entries.len()
+        );
+        return Ok(());
+    }
+    let mut per_app: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut per_title: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut active = 0u64;
+    for w in entries.windows(2) {
+        // A gap is the time spent in w[0]'s state; cap it (lunch, meetings) so one stale entry
+        // doesn't dominate.
+        let dur = w[1].0.saturating_sub(w[0].0).min(300);
+        let (app, title) = (&w[0].1, &w[0].2);
+        if app == "(idle)" || app.is_empty() {
+            continue;
+        }
+        active += dur;
+        *per_app.entry(app.clone()).or_default() += dur;
+        *per_title
+            .entry(format!("{app}  |  {title}"))
+            .or_default() += dur;
+    }
+    let fmt = |s: u64| format!("{}h{:02}m", s / 3600, (s % 3600) / 60);
+    let mut apps: Vec<_> = per_app.iter().collect();
+    apps.sort_by(|a, b| b.1.cmp(a.1));
+    let mut titles: Vec<_> = per_title.iter().collect();
+    titles.sort_by(|a, b| b.1.cmp(a.1));
+
+    let mut out = String::new();
+    out.push_str(&format!("== {day} 作業レポート（{persona}） ==\n"));
+    out.push_str(&format!("アクティブ合計: {}\n\n[アプリ別]\n", fmt(active)));
+    for (a, s) in apps.iter().take(15) {
+        out.push_str(&format!("  {:<7}  {}\n", fmt(**s), a));
+    }
+    out.push_str("\n[上位の作業 アプリ｜ウィンドウ]\n");
+    for (t, s) in titles.iter().take(25) {
+        out.push_str(&format!("  {:<7}  {}\n", fmt(**s), truncate(t, 80)));
+    }
+    println!("{out}");
+    let report_path = dir.join(format!("report-{day}.txt"));
+    let _ = std::fs::write(&report_path, &out);
+    println!("→ 保存: {}", report_path.display());
+
+    if ai {
+        let prompt = format!(
+            "以下は『{persona}』のPC作業ログの集計です。ここから、繰り返し・定型で\u{201c}自動化できそうな作業\u{201d}を重要な順に箇条書きで挙げてください。\
+             各項目は『作業内容 → 自動化の方針』の形で1〜2行にし、推測しすぎず、どのアプリ/ウィンドウから読み取れるかの根拠も短く添えてください。\n\n{out}"
+        );
+        println!("\nCopilotに自動化候補を抽出させています…");
+        let resp = copilot_send_and_read(uia, &prompt)?;
+        println!("\n== 自動化候補（Copilot）==\n{resp}");
+        let cand_path = dir.join(format!("automation-{day}.txt"));
+        let _ = std::fs::write(&cand_path, &resp);
+        println!("→ 保存: {}", cand_path.display());
+    }
+    Ok(())
+}
+
 /// Resident watcher: poll Slack (API only); when a message newer than startup arrives,
 /// open a fresh approval window in a separate process (winit runs once per process).
 /// Copilot is invoked only when a new message is detected — no idle quota use.
-fn watch(subdomain: &str, interval_secs: u64) -> Result<()> {
+/// Also runs the activity logger in a background thread so the resident covers both.
+fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()> {
     win32::hide_console_if_owned();
+    let dir = activity_log_dir(knowledge_path);
+    std::thread::spawn(move || activity_loop(dir));
     let exe = std::env::current_exe()?;
     let mut last_seen = 0f64;
     let mut initialized = false;
@@ -993,7 +1141,15 @@ fn main() -> Result<()> {
             reply_gui(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
         }
         "watch" => {
-            watch(&cfg.slack_subdomain, cfg.watch_interval_secs)?;
+            watch(&cfg.slack_subdomain, cfg.watch_interval_secs, &cfg.knowledge_path)?;
+        }
+        "activity" => {
+            activity(&cfg.knowledge_path)?;
+        }
+        "report" => {
+            let date = args.get(2).filter(|a| !a.starts_with("--")).map(String::as_str);
+            let ai = args.iter().any(|a| a == "--ai");
+            report(&uia, &cfg.knowledge_path, &cfg.persona, date, ai)?;
         }
         "learn" => {
             learn(&uia, &cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path)?;
@@ -1020,6 +1176,8 @@ fn main() -> Result<()> {
             println!("  tagami reply-gui        # review/edit/approve a reply in a desktop window, then send");
             println!("  tagami watch            # resident: poll Slack, pop the approval window on new messages");
             println!("  tagami learn            # learn your writing style from past Slack posts -> knowledge.md");
+            println!("  tagami activity         # resident: log which app/window you use over time -> Drive");
+            println!("  tagami report [date] [--ai]  # summarise a day's activity (--ai: Copilot suggests automation)");
             println!("  tagami reply [--send]   # CLI: draft (or send) a reply to the latest Slack message");
             println!("  tagami copilot-show     # bring the (hidden, off-screen) Copilot window back on screen");
             println!("  tagami update           # self-update from the latest GitHub release");

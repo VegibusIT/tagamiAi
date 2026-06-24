@@ -1,11 +1,16 @@
 //! Win32 window helpers: enumerate windows, read class/title/pid, and "wake"
 //! Chromium/WebView2 accessibility via WM_GETOBJECT.
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, BOOL, FALSE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VIRTUAL_KEY,
-    VK_CONTROL, VK_RETURN,
+    mouse_event, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, VIRTUAL_KEY, VK_CONTROL, VK_RETURN,
 };
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -141,6 +146,63 @@ pub fn work_area() -> (i32, i32, i32, i32) {
         );
     }
     (r.left, r.top, r.right - r.left, r.bottom - r.top)
+}
+
+/// Seconds since the user last touched the keyboard/mouse — so the activity logger can tell
+/// "actually working" from "stepped away / screensaver".
+pub fn idle_seconds() -> u64 {
+    unsafe {
+        let mut lii = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if GetLastInputInfo(&mut lii).as_bool() {
+            return GetTickCount().wrapping_sub(lii.dwTime) as u64 / 1000;
+        }
+    }
+    0
+}
+
+/// The active window's (executable name, window title) — e.g. ("Code.exe", "main.rs - tagamiAi").
+pub fn foreground_app_title() -> (String, String) {
+    let hwnd = get_foreground_window();
+    if hwnd.is_invalid() {
+        return (String::new(), String::new());
+    }
+    (process_name(window_pid(hwnd)), window_text(hwnd))
+}
+
+/// Executable file name (e.g. "EXCEL.EXE") for a process id, or "" if it can't be read.
+pub fn process_name(pid: u32) -> String {
+    unsafe {
+        let h = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
+            Ok(h) => h,
+            Err(_) => return String::new(),
+        };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT(0), PWSTR(buf.as_mut_ptr()), &mut len)
+                .is_ok();
+        let _ = CloseHandle(h);
+        if ok {
+            let full = String::from_utf16_lossy(&buf[..len as usize]);
+            return full.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+        }
+    }
+    String::new()
+}
+
+/// Local wall-clock now: ("YYYY-MM-DD", "HH:MM:SS", unix_epoch_seconds).
+pub fn local_now() -> (String, String, u64) {
+    let st = unsafe { GetLocalTime() };
+    let date = format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay);
+    let time = format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond);
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (date, time, epoch)
 }
 
 /// Position AND size a window without changing focus or z-order. Used to tuck Copilot into a
