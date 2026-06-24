@@ -563,6 +563,62 @@ fn write_shared_report(
     path
 }
 
+/// Drive folder for diagnostic logs (so a hidden resident's failures are still visible).
+fn logs_dir(knowledge_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(knowledge_path)
+        .parent()
+        .map(|p| p.join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"))
+}
+
+/// Append a timestamped line to today's log (logs/YYYY-MM-DD.log) on Drive. Best-effort.
+fn log_line(knowledge_path: &str, level: &str, msg: &str) {
+    use std::io::Write;
+    let dir = logs_dir(knowledge_path);
+    let _ = std::fs::create_dir_all(&dir);
+    let (date, time, _) = win32::local_now();
+    let line = format!("{date} {time} [{level}] {}\n", msg.replace(['\r', '\n'], " "));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{date}.log")))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Read the most recent log lines (newest last) for the GUI log view.
+fn read_recent_logs(knowledge_path: &str, max_lines: usize) -> String {
+    let dir = logs_dir(knowledge_path);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("log"))
+        .collect();
+    files.sort();
+    // newest 2 files, read in chronological order
+    let mut recent: Vec<_> = files.iter().rev().take(2).cloned().collect();
+    recent.sort();
+    let mut lines: Vec<String> = Vec::new();
+    for f in &recent {
+        if let Ok(txt) = std::fs::read_to_string(f) {
+            for l in txt.lines() {
+                lines.push(l.to_string());
+            }
+        }
+    }
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    if lines.is_empty() {
+        "（まだログはありません）".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Path of the logon-autostart launcher in the user's Startup folder.
 fn autostart_path() -> std::path::PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
@@ -749,25 +805,47 @@ fn report(
 /// Also runs the activity logger in a background thread so the resident covers both.
 fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()> {
     win32::hide_console_if_owned();
+    log_line(
+        knowledge_path,
+        "INFO",
+        &format!("常駐を開始 v{}（{}）", updater::current_version(), subdomain),
+    );
     // Self-update on startup, then every ~6h, relaunching as `watch` so the resident stays
-    // current automatically (errors — e.g. offline — are ignored; we just keep watching).
-    let _ = updater::update_if_newer(&["watch"], false);
+    // current automatically (errors — e.g. offline — are logged but non-fatal).
+    if let Err(e) = updater::update_if_newer(&["watch"], false) {
+        log_line(knowledge_path, "WARN", &format!("自動更新の確認に失敗: {e}"));
+    }
     let mut last_update = std::time::Instant::now();
     let dir = activity_log_dir(knowledge_path);
     std::thread::spawn(move || activity_loop(dir));
     let exe = std::env::current_exe()?;
     let mut last_seen = 0f64;
     let mut initialized = false;
+    let mut last_err = String::new();
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs.max(30)));
         if last_update.elapsed() >= Duration::from_secs(6 * 3600) {
             last_update = std::time::Instant::now();
-            let _ = updater::update_if_newer(&["watch"], false);
+            if let Err(e) = updater::update_if_newer(&["watch"], false) {
+                log_line(knowledge_path, "WARN", &format!("自動更新の確認に失敗: {e}"));
+            }
         }
         let latest = match latest_incoming_ts(subdomain) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                // Log Slack-poll failures once per distinct message (avoid spamming the log).
+                let msg = e.to_string();
+                if msg != last_err {
+                    log_line(knowledge_path, "WARN", &format!("Slack確認に失敗: {msg}"));
+                    last_err = msg;
+                }
+                continue;
+            }
         };
+        if !last_err.is_empty() {
+            log_line(knowledge_path, "INFO", "Slack確認が復帰しました");
+            last_err.clear();
+        }
         if !initialized {
             last_seen = latest; // ignore the existing backlog at startup
             initialized = true;
@@ -775,6 +853,7 @@ fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()
         }
         if latest > last_seen + 0.000_5 {
             last_seen = latest;
+            log_line(knowledge_path, "INFO", "新着メッセージを検知 → 承認ウィンドウを起動");
             let _ = std::process::Command::new(&exe).arg("reply-gui").status();
         }
     }
@@ -933,6 +1012,7 @@ fn reply_gui(persona: &str, subdomain: &str, knowledge_path: &str, auto: bool) -
         r_loading: false,
         r_rx: None,
         r_msg: String::new(),
+        log_text: String::new(),
         s_persona: persona.to_owned(),
         s_subdomain: subdomain.to_owned(),
         s_knowledge: knowledge_path.to_owned(),
@@ -1010,6 +1090,7 @@ enum View {
     Home,
     Reply,
     Report,
+    Log,
     Settings,
 }
 
@@ -1037,6 +1118,8 @@ struct GuiApp {
     r_loading: bool,
     r_rx: Option<std::sync::mpsc::Receiver<std::result::Result<String, String>>>,
     r_msg: String,
+    // log view
+    log_text: String,
     // settings editor
     s_persona: String,
     s_subdomain: String,
@@ -1064,7 +1147,14 @@ impl GuiApp {
                     Ok(PrepMsg::Ready(Box::new(p)))
                 }
             })();
-            let _ = tx.send(result.unwrap_or_else(|e| PrepMsg::Error(e.to_string())));
+            let msg = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    log_line(&knowledge, "ERROR", &format!("返信準備に失敗: {e}"));
+                    PrepMsg::Error(e.to_string())
+                }
+            };
+            let _ = tx.send(msg);
         });
         self.rx = Some(rx);
         self.stage = Stage::Loading;
@@ -1087,6 +1177,9 @@ impl GuiApp {
                 let out = aggregate_activity(&knowledge, &persona, &date)?;
                 copilot_send_and_read(&uia, &automation_prompt(&persona, &out))
             })();
+            if let Err(e) = &result {
+                log_line(&knowledge, "ERROR", &format!("自動化候補の抽出に失敗: {e}"));
+            }
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
         self.r_rx = Some(rx);
@@ -1120,9 +1213,42 @@ impl GuiApp {
                     .unwrap_or_else(|e| e.to_string());
         }
         ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new("📜   ログ（エラー・動作履歴）").min_size(big))
+            .clicked()
+        {
+            self.view = View::Log;
+            self.log_text = read_recent_logs(&self.knowledge_path, 400);
+        }
+        ui.add_space(8.0);
         if ui.add(egui::Button::new("⚙   設定").min_size(big)).clicked() {
             self.view = View::Settings;
         }
+    }
+
+    fn ui_log(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui;
+        ui.horizontal(|ui| {
+            ui.label("常駐・返信・更新の動作履歴とエラーです（新しいものが下）。");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("📁 ログフォルダを開く").clicked() {
+                    let dir = logs_dir(&self.knowledge_path);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                }
+                if ui.button("🔄 更新").clicked() {
+                    self.log_text = read_recent_logs(&self.knowledge_path, 400);
+                }
+            });
+        });
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .id_source("logview")
+            .max_height(540.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.monospace(&self.log_text);
+            });
     }
 
     fn ui_report(&mut self, ui: &mut eframe::egui::Ui) {
@@ -1313,8 +1439,18 @@ impl GuiApp {
                     {
                         if let Some(sc) = &self.sc {
                             match sc.post_message(&self.channel, &self.draft, Some(&self.thread_ts)) {
-                                Ok(j) => self.status = format!("送信しました（ok={}）", j["ok"]),
-                                Err(e) => self.status = format!("送信エラー: {e}"),
+                                Ok(j) => {
+                                    self.status = format!("送信しました（ok={}）", j["ok"]);
+                                    log_line(
+                                        &self.knowledge_path,
+                                        "INFO",
+                                        &format!("返信を送信（ch={}）", self.channel),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.status = format!("送信エラー: {e}");
+                                    log_line(&self.knowledge_path, "ERROR", &format!("送信失敗: {e}"));
+                                }
                             }
                             self.done = true;
                         }
@@ -1422,6 +1558,13 @@ impl eframe::App for GuiApp {
                         self.view = View::Settings;
                     }
                     if ui
+                        .selectable_label(self.view == View::Log, "📜 ログ")
+                        .clicked()
+                    {
+                        self.view = View::Log;
+                        self.log_text = read_recent_logs(&self.knowledge_path, 400);
+                    }
+                    if ui
                         .selectable_label(self.view == View::Report, "📊 レポート")
                         .clicked()
                     {
@@ -1447,6 +1590,7 @@ impl eframe::App for GuiApp {
                 View::Home => self.ui_home(ui),
                 View::Reply => self.ui_reply(ui, ctx),
                 View::Report => self.ui_report(ui),
+                View::Log => self.ui_log(ui),
                 View::Settings => self.ui_settings(ui),
             }
         });
@@ -1458,7 +1602,15 @@ fn main() -> Result<()> {
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
     let uia = Uia::new()?;
     let cfg = config::Config::load();
-    match cmd {
+    // Record any panic to the log on Drive — vital for the hidden resident.
+    {
+        let kp = cfg.knowledge_path.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            log_line(&kp, "PANIC", &format!("{info}"));
+        }));
+    }
+    let result = (|| -> Result<()> {
+        match cmd {
         "slack-read" => slack_read(&uia)?,
         "copilot-read" => copilot_read(&uia)?,
         "copilot-type" => {
@@ -1541,6 +1693,11 @@ fn main() -> Result<()> {
             // No argument (e.g. double-click) or unknown command: open the desktop GUI home.
             reply_gui(&cfg.persona, &cfg.slack_subdomain, &cfg.knowledge_path, false)?;
         }
+        }
+        Ok(())
+    })();
+    if let Err(e) = &result {
+        log_line(&cfg.knowledge_path, "ERROR", &format!("コマンド'{cmd}'で終了: {e}"));
     }
-    Ok(())
+    result
 }
