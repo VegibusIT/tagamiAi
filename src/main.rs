@@ -749,6 +749,10 @@ fn report(
 /// Also runs the activity logger in a background thread so the resident covers both.
 fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()> {
     win32::hide_console_if_owned();
+    // Self-update on startup, then every ~6h, relaunching as `watch` so the resident stays
+    // current automatically (errors — e.g. offline — are ignored; we just keep watching).
+    let _ = updater::update_if_newer(&["watch"], false);
+    let mut last_update = std::time::Instant::now();
     let dir = activity_log_dir(knowledge_path);
     std::thread::spawn(move || activity_loop(dir));
     let exe = std::env::current_exe()?;
@@ -756,6 +760,10 @@ fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()
     let mut initialized = false;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs.max(30)));
+        if last_update.elapsed() >= Duration::from_secs(6 * 3600) {
+            last_update = std::time::Instant::now();
+            let _ = updater::update_if_newer(&["watch"], false);
+        }
         let latest = match latest_incoming_ts(subdomain) {
             Ok(t) => t,
             Err(_) => continue,

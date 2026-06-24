@@ -15,9 +15,21 @@ pub fn current_version() -> &'static str {
     CURRENT_VERSION
 }
 
-/// Check the latest GitHub release; if newer, download, replace this exe, relaunch.
+/// CLI `tagami update`: check, update if newer, relaunch the GUI.
 pub fn check_and_update() -> Result<()> {
-    let client = reqwest::blocking::Client::new();
+    if !update_if_newer(&[], true)? {
+        println!("最新版です（v{CURRENT_VERSION}）。");
+    }
+    Ok(())
+}
+
+/// Check the latest GitHub release; if newer, download + swap this exe + relaunch it with
+/// `relaunch_args` and exit (so this call does not return on success). Returns Ok(false) when
+/// already up to date. `verbose` controls progress printing (off for the silent auto-check).
+pub fn update_if_newer(relaunch_args: &[&str], verbose: bool) -> Result<bool> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let rel: serde_json::Value = client
         .get(&url)
@@ -32,8 +44,7 @@ pub fn check_and_update() -> Result<()> {
     }
     let current = format!("v{CURRENT_VERSION}");
     if tag == current {
-        println!("最新版です（{current}）。");
-        return Ok(());
+        return Ok(false);
     }
 
     let download_url = rel["assets"]
@@ -47,7 +58,9 @@ pub fn check_and_update() -> Result<()> {
         .ok_or_else(|| anyhow!("リリース {tag} に {ASSET} が見つかりません"))?
         .to_string();
 
-    println!("新バージョン {tag} を取得します（現在 {current}）…");
+    if verbose {
+        println!("新バージョン {tag} を取得します（現在 {current}）…");
+    }
     let bytes = client
         .get(&download_url)
         .header("User-Agent", "tagami-updater")
@@ -66,7 +79,11 @@ pub fn check_and_update() -> Result<()> {
     std::fs::rename(&current_exe, &old)?;
     std::fs::rename(&tmp, &current_exe)?;
 
-    println!("更新完了：{tag}。新バージョンで再起動します。");
-    let _ = std::process::Command::new(&current_exe).spawn();
+    if verbose {
+        println!("更新完了：{tag}。新バージョンで再起動します。");
+    }
+    let _ = std::process::Command::new(&current_exe)
+        .args(relaunch_args)
+        .spawn();
     std::process::exit(0);
 }
