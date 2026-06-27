@@ -380,12 +380,20 @@ fn find_latest_target(sc: &slack_api::SlackClient, me: &str) -> Result<Option<In
             Err(_) => continue,
         };
         if let Some(msgs) = h["messages"].as_array() {
+            // Per channel: the newest incoming message worth replying to, AND the newest message
+            // *we* posted. If we already posted after the incoming one, it's handled — skip it.
+            let mut my_latest = 0f64;
+            let mut cand: Option<IncomingTarget> = None;
             for m in msgs {
                 let u = m["user"].as_str().unwrap_or("");
                 let text = m["text"].as_str().unwrap_or("");
                 let ts_str = m["ts"].as_str().unwrap_or("");
                 let ts: f64 = ts_str.parse().unwrap_or(0.0);
-                if u == me || u.is_empty() || text.trim().is_empty() {
+                if u == me {
+                    my_latest = my_latest.max(ts);
+                    continue;
+                }
+                if u.is_empty() || text.trim().is_empty() {
                     continue;
                 }
                 let mentioned = text.contains(&mention_tag);
@@ -393,9 +401,9 @@ fn find_latest_target(sc: &slack_api::SlackClient, me: &str) -> Result<Option<In
                 if !is_dm && !mentioned {
                     continue;
                 }
-                if best.as_ref().map_or(true, |b| ts > b.ts) {
+                if cand.as_ref().map_or(true, |b| ts > b.ts) {
                     let thread_ts = m["thread_ts"].as_str().unwrap_or(ts_str).to_string();
-                    best = Some(IncomingTarget {
+                    cand = Some(IncomingTarget {
                         channel: id.to_string(),
                         text: text.to_string(),
                         thread_ts,
@@ -403,6 +411,13 @@ fn find_latest_target(sc: &slack_api::SlackClient, me: &str) -> Result<Option<In
                         mentioned,
                         is_dm,
                     });
+                }
+            }
+            if let Some(c) = cand {
+                // Already replied (by us, manually or via the bot) if our latest message in this
+                // channel is newer than the incoming one → don't treat it as needing a reply.
+                if c.ts > my_latest && best.as_ref().map_or(true, |b| c.ts > b.ts) {
+                    best = Some(c);
                 }
             }
         }
@@ -799,6 +814,25 @@ fn report(
     Ok(())
 }
 
+/// Persisted high-water mark of the message ts we've already acted on, so the watcher never
+/// re-notifies for it across restarts/auto-updates (the old in-memory value reset every restart).
+fn watch_state_path() -> std::path::PathBuf {
+    config::config_path().with_file_name("watch_state.txt")
+}
+fn load_last_seen() -> f64 {
+    std::fs::read_to_string(watch_state_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+fn save_last_seen(ts: f64) {
+    let p = watch_state_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, format!("{ts}"));
+}
+
 /// Resident watcher: poll Slack (API only); when a message newer than startup arrives,
 /// open a fresh approval window in a separate process (winit runs once per process).
 /// Copilot is invoked only when a new message is detected — no idle quota use.
@@ -819,8 +853,10 @@ fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()
     let dir = activity_log_dir(knowledge_path);
     std::thread::spawn(move || activity_loop(dir));
     let exe = std::env::current_exe()?;
-    let mut last_seen = 0f64;
-    let mut initialized = false;
+    // Load the persisted high-water mark. If we have one, act on anything strictly newer; if
+    // not (first ever run), the first poll establishes the baseline (existing backlog ignored).
+    let mut last_seen = load_last_seen();
+    let mut have_baseline = last_seen > 0.0;
     let mut last_err = String::new();
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs.max(30)));
@@ -846,14 +882,25 @@ fn watch(subdomain: &str, interval_secs: u64, knowledge_path: &str) -> Result<()
             log_line(knowledge_path, "INFO", "Slack確認が復帰しました");
             last_err.clear();
         }
-        if !initialized {
-            last_seen = latest; // ignore the existing backlog at startup
-            initialized = true;
+        // No actionable target right now (or a transient empty read) — don't touch the baseline,
+        // or we'd "forget" and re-notify an already-handled message later.
+        if latest <= 0.0 {
+            continue;
+        }
+        if !have_baseline {
+            last_seen = latest; // first ever run: treat the existing backlog as already seen
+            have_baseline = true;
+            save_last_seen(last_seen);
             continue;
         }
         if latest > last_seen + 0.000_5 {
             last_seen = latest;
-            log_line(knowledge_path, "INFO", "新着メッセージを検知 → 承認ウィンドウを起動");
+            save_last_seen(last_seen);
+            log_line(
+                knowledge_path,
+                "INFO",
+                &format!("新着メッセージを検知（ts={latest:.0}）→ 承認ウィンドウを起動"),
+            );
             let _ = std::process::Command::new(&exe).arg("reply-gui").status();
         }
     }
@@ -1006,6 +1053,7 @@ fn reply_gui(persona: &str, subdomain: &str, knowledge_path: &str, auto: bool) -
         status: String::new(),
         error: String::new(),
         done: false,
+        close_at: None,
         r_date: win32::local_now().0,
         r_text: String::new(),
         r_ai: String::new(),
@@ -1111,6 +1159,7 @@ struct GuiApp {
     status: String,
     error: String,
     done: bool,
+    close_at: Option<std::time::Instant>,
     // report view
     r_date: String,
     r_text: String,
@@ -1440,7 +1489,8 @@ impl GuiApp {
                         if let Some(sc) = &self.sc {
                             match sc.post_message(&self.channel, &self.draft, Some(&self.thread_ts)) {
                                 Ok(j) => {
-                                    self.status = format!("送信しました（ok={}）", j["ok"]);
+                                    self.status = format!("送信しました（ok={}）。まもなく閉じます。", j["ok"]);
+                                    self.close_at = Some(std::time::Instant::now());
                                     log_line(
                                         &self.knowledge_path,
                                         "INFO",
@@ -1478,6 +1528,16 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
+
+        // After a successful send, close the window automatically so it never looks like it's
+        // about to send again.
+        if let Some(t) = self.close_at {
+            if t.elapsed() >= std::time::Duration::from_millis(2500) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+        }
 
         // Reply preparation result (background thread).
         if self.stage == Stage::Loading {
